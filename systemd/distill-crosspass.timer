@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the insight cross-session distiller daily (the gate decides whether to actually run)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30min
+
+[Install]
+WantedBy=timers.target

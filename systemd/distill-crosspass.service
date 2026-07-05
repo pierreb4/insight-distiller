@@ -1,0 +1,10 @@
+[Unit]
+Description=Insight cross-session/cross-project distiller (gated, staging-only)
+# Runs the cross-pass gate (>=6 REAL new sessions since marker + a 12h cost-ceiling); only on RUN
+# does it spawn the memory-capped MAP/REDUCE agents. Writes ONLY signatures//staging/ + its own
+# marker — never canonical nodes/INDEX. Sandbox-filtered (real .../projects/... sessions only).
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/insights/distill-crosspass.sh
+Nice=10

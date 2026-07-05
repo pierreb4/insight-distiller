@@ -1,0 +1,385 @@
+#!/bin/bash
+# distill.sh — surface raw insight-log records for distillation into linked
+# insight nodes under ~/.claude/insights/.
+#
+# Model-driven by design: this only SHOWS candidate material from the firehose
+# (~/claude-insights.log). You (the model) read it, then write/extend nodes and
+# their [[links]], update INDEX.md, and finally advance the marker. See README.md.
+#
+#   distill.sh                  show records since .last-distilled (or last 25)
+#   distill.sh -n 50            show the last 50 records, ignoring the marker
+#   distill.sh --mark <ISO-ts>  record how far you have distilled
+#   distill.sh --status         dashboard: capture health, backlog, graph stats
+#   distill.sh --brief          one-line health summary (used by the SessionStart hook)
+#   distill.sh --gate           exit 0=run / 1=skip — does backlog warrant a distill agent now?
+#   distill.sh --review         list staged proposals from the auto-distiller (distill-run.sh)
+#   distill.sh --reuse          outcome audit: which promoted nodes get reused (incoming [[links]])
+set -euo pipefail
+
+LOG="$HOME/claude-insights.log"
+DIR="$HOME/.claude/insights"
+MARK="$DIR/.last-distilled"
+
+# GNU/BSD portability — Darwin's stat/date lack -c/-d. GNU path first so Linux
+# behavior is byte-identical; BSD fallbacks parse the two formats we write
+# (date -Iseconds markers, %F frontmatter dates).
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
+_fsize() { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null; }
+_epoch() { date -d "$1" +%s 2>/dev/null || python3 -c 'import sys; from datetime import datetime; print(int(datetime.fromisoformat(sys.argv[1]).timestamp()))' "$1" 2>/dev/null; }
+_fmtts() { date -d "@$1" "$2" 2>/dev/null || date -r "$1" "$2" 2>/dev/null; }
+
+case "${1:-show}" in
+  --mark)
+    ts="${2:-}"
+    [ -n "$ts" ] || { echo "usage: distill.sh --mark <ISO-timestamp>" >&2; exit 2; }
+    printf '%s\n' "$ts" > "$MARK"
+    echo "marked distilled through: $ts"
+    ;;
+  -n)
+    n="${2:-25}"; since=""
+    [ -f "$LOG" ] || { echo "no log at $LOG"; exit 0; }
+    echo "# last $n records (marker ignored)"; echo
+    awk -v since="$since" -v N="$n" '
+      BEGIN { RS="\n---\n" }
+      length($0) > 0 { rec[++c]=$0; t=$0; sub(/ .*/,"",t); ts[c]=t }
+      END {
+        start = (c > N) ? c - N + 1 : 1
+        for (i = start; i <= c; i++) print rec[i] "\n---"
+      }' "$LOG"
+    ;;
+  --write-check|--canary-write)
+    # Real-write canary: actively confirm a sandboxed headless agent can produce a file that
+    # LANDS in staging/. Guards the silent class that hid for weeks (the staging write was
+    # permission-blocked; rc/marker looked fine). ~20-30s, one cheap agent — run occasionally
+    # (manually or from the timer), NOT in --brief. Outcome -> .last-write-check (shown by --status).
+    set +e
+    OUT="$(mktemp -d)"; mkdir -p "$DIR/staging"
+    systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$OUT" -p MemoryMax=2G -- \
+      claude -p "Use the Write tool to create ./_writecheck.md with EXACTLY the text: ok. Nothing else." \
+      --model "${DISTILL_MODEL:-sonnet}" --allowed-tools Write --add-dir "$OUT" --permission-mode acceptEdits >/dev/null 2>&1
+    rc=$?; landed=0
+    if [ "$rc" -eq 0 ] && [ -s "$OUT/_writecheck.md" ]; then
+      cp -f "$OUT/_writecheck.md" "$DIR/staging/_writecheck.md" 2>/dev/null && [ -s "$DIR/staging/_writecheck.md" ] && landed=1
+      rm -f "$DIR/staging/_writecheck.md"
+    fi
+    rm -rf "$OUT"; ts=$(date -Iseconds)
+    if [ "$landed" -eq 1 ]; then
+      printf '%s OK\n' "$ts" > "$DIR/.last-write-check"
+      echo "real-write canary: OK — a sandboxed agent produced a file and it landed in staging/  ($ts)"
+    else
+      printf '%s FAIL\n' "$ts" > "$DIR/.last-write-check"
+      echo "real-write canary: FAIL (rc=$rc) — the distiller cannot deliver a file to staging/. Proposals would be silently lost (permission guard / auth / sandbox). See the 2026-06-23 finding."
+    fi
+    ;;
+  --status|status)
+    set +e   # read-only reporting: never abort mid-report on an empty grep
+    now=$(date +%s)
+    _age() {  # $1 = elapsed seconds -> "Xd Yh / Xh Ym / Xm ago"
+      local s="$1"
+      [ -z "$s" ] && { echo "?"; return; }
+      [ "$s" -lt 0 ] && { echo "just now"; return; }
+      local d=$((s/86400)) h=$(((s%86400)/3600)) m=$(((s%3600)/60))
+      if   [ "$d" -gt 0 ]; then echo "${d}d ${h}h ago"
+      elif [ "$h" -gt 0 ]; then echo "${h}h ${m}m ago"
+      else echo "${m}m ago"; fi
+    }
+    echo "insight store status   ($(date '+%F %H:%M'))"
+    echo "============================================"
+
+    # tier 1 — capture firehose
+    if [ -f "$LOG" ]; then
+      recs=$(grep -c '^---$' "$LOG" 2>/dev/null)
+      mt=$(_mtime "$LOG")
+      sz=$(_fsize "$LOG" | numfmt --to=iec 2>/dev/null)
+      lastrec=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+\+[0-9:]+' "$LOG" 2>/dev/null | sort | tail -1)
+      echo "tier-1  capture    $LOG"
+      printf '   records ....... %s\n' "${recs:-0}"
+      if [ -n "$mt" ]; then
+        printf '   last write .... %s  (%s)  <- canary\n' "$(_fmtts "$mt" '+%F %H:%M')" "$(_age $((now-mt)))"
+      else
+        echo   "   last write .... ?"
+      fi
+      printf '   last record ... %s\n' "${lastrec:-?}"
+      printf '   size .......... %s\n' "${sz:-?}"
+      if [ -n "$mt" ] && [ $((now-mt)) -gt 86400 ]; then
+        echo "   WARN  no capture in >24h — if sessions have run, check the Stop hook (log-insights.sh)"
+      fi
+    else
+      echo "tier-1  capture    MISSING: $LOG  (Stop hook not writing?)"
+    fi
+
+    # tier 1 -> 2 — distillation.  TWO markers, kept distinct so a big "since last promotion" count
+    # can't masquerade as an agent backlog: the cheap agent TRIAGES into staging/ (.last-staged), and
+    # REVIEW promotes staged drafts into canonical nodes (.last-distilled, which advances only on review).
+    echo
+    echo "tier-1->2  distillation"
+    STAGEMARK="$DIR/.last-staged"
+    if [ -f "$LOG" ]; then
+      sbase="$STAGEMARK"; [ -f "$sbase" ] || sbase="$MARK"
+      if [ -f "$sbase" ]; then
+        ssince=$(cat "$sbase" 2>/dev/null); sts=$(_epoch "$ssince")
+        pending=$(awk -v s="$ssince" 'BEGIN{RS="\n---\n"} length($0){t=$0;sub(/ .*/,"",t); if(t>s)c++} END{print c+0}' "$LOG" 2>/dev/null)
+        verdict="caught up"; [ "${pending:-0}" -ge 75 ] && verdict="due — gate fires next run"   # 75 = gate T_MIN floor; keep in sync
+        printf '   agent triaged . up to %s  (%s)\n' "$ssince" "$([ -n "$sts" ] && _age $((now-sts)) || echo '?')"
+        printf '   pending triage  %s new records since  (%s; agent runs hourly-gated)\n' "${pending:-0}" "$verdict"
+      else
+        tot=$(grep -c '^---$' "$LOG" 2>/dev/null)
+        printf '   pending triage  no marker yet — all %s records pending\n' "${tot:-0}"
+      fi
+      nstaged=$(ls "$DIR"/staging/*.md 2>/dev/null | grep -c .)
+      if [ "${nstaged:-0}" -gt 0 ]; then
+        printf '   awaiting review %s staged  → distill.sh --review\n' "$nstaged"
+      else
+        printf '   awaiting review none staged\n'
+      fi
+      if [ -f "$MARK" ]; then
+        psince=$(cat "$MARK" 2>/dev/null); pts=$(_epoch "$psince")
+        printf '   promoted to ... %s  (%s — canonical; advances only on review)\n' "$psince" "$([ -n "$pts" ] && _age $((now-pts)) || echo '?')"
+      fi
+    fi
+    # auto-distiller agent health — it can die silently (401 / crash / disabled timer),
+    # leaving empty staging that LOOKS like "nothing to distill" when the agent never ran.
+    RUNLOG="$DIR/.distill-run.log"
+    if [ -f "$RUNLOG" ]; then
+      lastdone=$(grep -E '\] done rc=' "$RUNLOG" 2>/dev/null | tail -1)
+      if [ -n "$lastdone" ]; then
+        drc=$(printf '%s' "$lastdone" | sed -n 's/.*done rc=\([0-9-]*\).*/\1/p')
+        dwhen=$(printf '%s' "$lastdone" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
+        printf '   last agent run  %s  rc=%s\n' "${dwhen:-?}" "${drc:-?}"
+        case "$drc" in 0|''|*[!0-9]*) ;; *) echo "   WARN  last auto-distill FAILED (rc=$drc) — empty staging = the AGENT died, not 'nothing to distill'. See $RUNLOG" ;; esac
+      fi
+      # only auth-failures SINCE the last clean run — a resolved 401 shouldn't warn forever
+      lastok=$(grep -nE '\] done rc=0' "$RUNLOG" 2>/dev/null | tail -1 | cut -d: -f1)
+      af=$(tail -n +"${lastok:-1}" "$RUNLOG" 2>/dev/null | grep -ciE '401|failed to authenticate|invalid authentication')
+      [ "${af:-0}" -gt 0 ] && echo "   WARN  ${af} auth-failure line(s) since the last clean run — headless 'claude -p' can't authenticate (reauth needed)"
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+      ta=$(systemctl --user is-active distill.timer 2>/dev/null)
+      [ "$ta" = "active" ] || echo "   WARN  distill.timer is '${ta:-unknown}' — auto-distiller not scheduled"
+      wt=$(systemctl --user is-active distill-writecheck.timer 2>/dev/null)
+      [ "$wt" = "active" ] || echo "   WARN  distill-writecheck.timer is '${wt:-unknown}' — daily write-canary not scheduled"
+    elif command -v launchctl >/dev/null 2>&1 || command -v crontab >/dev/null 2>&1; then
+      # non-systemd machines: launchd agents (macOS) or cron may carry the timers
+      # (BOOTSTRAP.md); both exist on a Mac, so WARN only when NEITHER schedules a job.
+      lj=$(launchctl list 2>/dev/null); ct=$(crontab -l 2>/dev/null)
+      printf '%s\n' "$lj" | grep -q 'local\.distill$' || printf '%s' "$ct" | grep -q 'distill-run\.sh' \
+        || echo "   WARN  auto-distiller not scheduled — no local.distill launchd job, no distill-run.sh cron entry"
+      printf '%s\n' "$lj" | grep -q 'local\.distill-writecheck$' || printf '%s' "$ct" | grep -q 'write-check' \
+        || echo "   WARN  daily write-canary not scheduled — no local.distill-writecheck launchd job, no write-check cron entry"
+    fi
+    # real-write canary (set by `distill.sh --write-check`; spawns an agent, so it's NOT in --brief)
+    if [ -f "$DIR/.last-write-check" ]; then
+      wcl=$(cat "$DIR/.last-write-check" 2>/dev/null); wcst=${wcl##* }; wcts=${wcl% *}
+      wcs=$(_epoch "$wcts"); wcage=""; [ -n "$wcs" ] && wcage="  ($(_age $((now-wcs))))"
+      printf '   real-write .... %s%s\n' "${wcst:-?}" "$wcage"
+      [ "$wcst" = FAIL ] && echo "   WARN  distiller CANNOT write to staging — proposals silently lost (2026-06-23 permission finding)"
+      [ "$wcst" = OK ] && [ -n "$wcs" ] && [ $((now-wcs)) -gt 604800 ] && echo "   WARN  write-canary stale (>7d) — run: distill.sh --write-check"
+    else
+      echo "   real-write .... <never> — run: distill.sh --write-check"
+    fi
+
+    # tier 1 -> 2 — cross-session pass (manual / draft-only; sibling script, reused via --status)
+    if [ -x "$DIR/distill-crosspass.sh" ]; then
+      echo
+      echo "tier-1->2  cross-session pass"
+      "$DIR/distill-crosspass.sh" --status 2>/dev/null | sed -n '3,$p'
+    fi
+
+    # tier 2 — curated graph
+    echo
+    echo "tier-2  graph      $DIR"
+    nodes=$(ls "$DIR"/*.md 2>/dev/null | grep -vE '/(INDEX|README|BOOTSTRAP)\.md$')
+    printf '   nodes ......... %s\n' "$(printf '%s\n' "$nodes" | grep -c .)"
+    if [ -n "$nodes" ]; then
+      edges=$(grep -hoE '\[\[[a-z0-9-]+\]\]' $nodes 2>/dev/null | sort -u | tr -d '][')
+      printf '   edges ......... %s unique [[wikilinks]]\n' "$(printf '%s\n' "$edges" | grep -c .)"
+      dangling=""
+      for slug in $edges; do [ -f "$DIR/$slug.md" ] || dangling="$dangling $slug"; done
+      [ -n "$dangling" ] && echo "   dangling ......$dangling  (forward-refs; see README)" || echo "   dangling ...... none"
+      unindexed=""
+      for f in $nodes; do b=$(basename "$f"); grep -qF "$b" "$DIR/INDEX.md" 2>/dev/null || unindexed="$unindexed $b"; done
+      [ -n "$unindexed" ] && echo "   unindexed .....$unindexed" || echo "   unindexed ..... none (all nodes in INDEX.md)"
+    fi
+    ;;
+  --brief)
+    set +e   # one-line health summary, e.g. for a SessionStart hook
+    [ -f "$LOG" ] || { echo "insight store · capture MISSING ($LOG)"; exit 0; }
+    now=$(date +%s)
+    recs=$(grep -c '^---$' "$LOG" 2>/dev/null)
+    mt=$(_mtime "$LOG")
+    a=$((now-${mt:-now}))
+    if   [ "$a" -ge 86400 ]; then age="$((a/86400))d"
+    elif [ "$a" -ge 3600 ]; then age="$((a/3600))h"
+    else age="$((a/60))m"; fi
+    sbase="$DIR/.last-staged"; [ -f "$sbase" ] || sbase="$MARK"   # agent-triage marker = true intake backlog, not the review backlog
+    since=""; [ -f "$sbase" ] && since=$(cat "$sbase" 2>/dev/null)
+    if [ -n "$since" ]; then
+      undist=$(awk -v s="$since" 'BEGIN{RS="\n---\n"} length($0){t=$0;sub(/ .*/,"",t); if(t>s)c++} END{print c+0}' "$LOG" 2>/dev/null)
+    else
+      undist="${recs:-0}"
+    fi
+    nodes=$(ls "$DIR"/*.md 2>/dev/null | grep -vcE '/(INDEX|README|BOOTSTRAP)\.md$')
+    stale=""; [ -n "$mt" ] && [ "$a" -gt 86400 ] && stale="[!] capture stale · "
+    # cross-session pass: surface ONLY staged proposals awaiting review. The old manual
+    # "x-pass: N new sessions" nudge was retired 2026-06-26 when the crosspass timer began
+    # auto-running the gated pass (the nudge to run it by hand is now obsolete). Its N was also a
+    # RAW firehose session-count — NOT sandbox-filtered — so it over-reported vs the gate/--status,
+    # which count real sessions via count_real_sessions. Staged is the only actionable signal left
+    # here (promotion stays manual); the real session-count lives in `--status`.
+    cpstg=$(ls "$DIR"/staging/*.md 2>/dev/null | grep -c .)
+    cpx=""; [ "${cpstg:-0}" -gt 0 ] && cpx=" · ${cpstg} staged"
+    echo "insight store · ${stale}${recs:-0} captured, last write ${age} ago · ${undist:-0} untriaged · ${nodes:-0} nodes${cpx}"
+    ;;
+  --gate)
+    # cron/timer decision: exit 0 = backlog warrants a distill-agent run, 1 = skip.
+    # Cheap (no LLM). Cadence = f(traffic, open-issues) — the agreed starting policy.
+    set +e
+    # -- tunables (adjust as we go) --
+    T_BASE=200; T_MIN=75; O_REF=5      # threshold T(O)=clamp(T_BASE*O_REF/(O_REF+O), T_MIN, T_BASE)
+    FRESH_DAYS=2; FRESH_MIN=20         # freshness floor: backlog>=FRESH_MIN unstaged >FRESH_DAYS -> run
+    MIN_INTERVAL_H=3                   # cost ceiling: at most one run per this many hours
+    STAGEMARK="$DIR/.last-staged"      # how far the agent has triaged (vs MARK=.last-distilled=canonical)
+    LASTRUN="$DIR/.last-run"           # agent run timestamps (appended by the distiller wrapper)
+    [ -f "$LOG" ] || { echo "gate: SKIP — no firehose at $LOG"; exit 1; }
+    now=$(date +%s)
+
+    # traffic U = records the agent hasn't triaged yet (since .last-staged, else .last-distilled)
+    base="$STAGEMARK"; [ -f "$base" ] || base="$MARK"
+    since=""; [ -f "$base" ] && since=$(cat "$base" 2>/dev/null)
+    if [ -n "$since" ]; then
+      U=$(awk -v s="$since" 'BEGIN{RS="\n---\n"} length($0){t=$0;sub(/ .*/,"",t); if(t>s)c++} END{print c+0}' "$LOG" 2>/dev/null)
+      ss=$(_epoch "$since"); age_d=$(( (now - ${ss:-now}) / 86400 ))
+    else
+      U=$(grep -c '^---$' "$LOG" 2>/dev/null); age_d=999
+    fi
+    U=${U:-0}
+
+    # open issues O = dangling links in the graph + open seven-dpt problems
+    nodes=$(ls "$DIR"/*.md 2>/dev/null | grep -vE '/(INDEX|README|BOOTSTRAP)\.md$')
+    dangling=0
+    if [ -n "$nodes" ]; then
+      for slug in $(grep -hoE '\[\[[a-z0-9-]+\]\]' $nodes 2>/dev/null | sort -u | tr -d ']['); do
+        [ -f "$DIR/$slug.md" ] || dangling=$((dangling+1))
+      done
+    fi
+    store="${SEVEN_DPT_DB:-${XDG_DATA_HOME:-$HOME/.local/share}/seven-dpt/store.json}"
+    probs=$(python3 -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1])); print(sum(1 for x in d.get("problems",[]) if x.get("status")=="open"))
+except Exception: print(0)' "$store" 2>/dev/null)
+    probs=${probs:-0}
+    O=$((dangling + probs))
+
+    # dynamic threshold: distill more eagerly when more is open
+    T=$(( T_BASE * O_REF / (O_REF + O) ))
+    [ "$T" -lt "$T_MIN" ] && T=$T_MIN
+    [ "$T" -gt "$T_BASE" ] && T=$T_BASE
+
+    # cost ceiling: too soon since the last run?
+    too_soon=0; lastrun_h=999
+    if [ -f "$LASTRUN" ]; then
+      lr=$(tail -n1 "$LASTRUN" 2>/dev/null); lrs=$(_epoch "$lr")
+      if [ -n "$lrs" ]; then lastrun_h=$(( (now-lrs)/3600 )); [ "$lastrun_h" -lt "$MIN_INTERVAL_H" ] && too_soon=1; fi
+    fi
+
+    # decision
+    go=0; why="below threshold (U=$U < T=$T)"
+    if [ "$U" -ge "$T" ]; then go=1; why="volume (U=$U >= T=$T)"; fi
+    if [ "$go" -eq 0 ] && [ "$U" -ge "$FRESH_MIN" ] && [ "$age_d" -ge "$FRESH_DAYS" ]; then
+      go=1; why="freshness (U=$U unstaged ${age_d}d >= ${FRESH_DAYS}d)"
+    fi
+    if [ "$too_soon" -eq 1 ]; then go=0; why="cost ceiling (last run ${lastrun_h}h < ${MIN_INTERVAL_H}h ago)"; fi
+
+    [ "$go" -eq 1 ] && v=RUN || v=SKIP
+    echo "gate: $v — traffic U=$U · open-issues O=$O (dangling $dangling + open-problems $probs) · threshold T=$T · $why"
+    [ "$go" -eq 1 ] && exit 0 || exit 1
+    ;;
+  --review)
+    set +e
+    S="$DIR/staging"
+    if [ ! -d "$S" ] || [ -z "$(ls -A "$S" 2>/dev/null)" ]; then echo "no staged proposals in $S"; exit 0; fi
+    echo "staged proposals ($S) — unreviewed drafts from the auto-distiller:"
+    echo
+    for f in "$S"/*.md; do
+      [ -f "$f" ] || continue
+      d="$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)"
+      echo "  • ${f##*/}"
+      echo "      $d"
+    done
+    echo
+    echo "promote:  mv $S/<slug>.md $DIR/   then add its line to $DIR/INDEX.md"
+    echo "discard:  rm $S/<slug>.md"
+    echo "when the batch is cleared, sync canonical marker:  distill.sh --mark \"\$(cat $DIR/.last-staged)\""
+    ;;
+  --reuse|--outcomes)
+    # Reuse/outcome audit — the NON-CIRCULAR quality signal for promoted nodes:
+    # does a node get *used* (linked to by later nodes)? Reality, not a judge's
+    # opinion; Goodhart-resistant (in-degree can't be faked without writing real
+    # linked nodes). DIAGNOSTIC only — read it to spot a too-loose bar or merge/
+    # retire candidates (seven-dpt#4); never optimize it.
+    #
+    # "Maturity" is INFORMATION VOLUME — firehose records since a node was created
+    # — not wall-clock days: busy spells carry more reuse-opportunity than quiet
+    # ones, and a record count doesn't lean on anyone's (or any cron's) sense of
+    # time. A node's reuse is judged only once enough later traffic has flowed past it.
+    set +e
+    AGED_RECS="${AGED_RECS:-500}"  # records of later traffic before reuse is judgeable (tunable; ~2-3 distill rounds)
+    now=$(date +%s)
+    nodes=$(ls "$DIR"/*.md 2>/dev/null | grep -vE '/(INDEX|README|BOOTSTRAP)\.md$')
+    [ -n "$nodes" ] || { echo "no nodes yet in $DIR"; exit 0; }
+    echo "insight reuse / outcome audit   ($(date '+%F'))"
+    echo "============================================"
+    echo "reuse = incoming [[wikilinks]] from later nodes;  maturity = firehose records since creation"
+    echo "(information volume, not days).  Diagnostic, never a target."
+    echo
+    printf '   %-46s %5s %6s %5s  %s\n' "node" "age" "info" "in<-" "verdict"
+    total=0; reused=0; mature=0; mature_unreused=0; young=0
+    for f in $nodes; do
+      slug=$(basename "$f" .md); total=$((total+1))
+      created=$(sed -n 's/^created:[[:space:]]*//p' "$f" | head -1)
+      [ -n "$created" ] || created=$(sed -n 's/^[[:space:]]*date:[[:space:]]*//p' "$f" | head -1)
+      cs=$(_epoch "$created")
+      if [ -n "$cs" ]; then age="$(( (now-cs)/86400 ))d"; else age="?"; fi
+      info=0
+      [ -f "$LOG" ] && [ -n "$created" ] && info=$(awk -v c="$created" 'BEGIN{RS="\n---\n"} length($0){t=$0;sub(/ .*/,"",t); if(t>c)n++} END{print n+0}' "$LOG" 2>/dev/null)
+      info=${info:-0}
+      indeg=$(grep -lF -- "[[$slug]]" $nodes 2>/dev/null | grep -v "/$slug\.md" | grep -c .)
+      [ "$indeg" -gt 0 ] && reused=$((reused+1))
+      if   [ "$info" -lt "$AGED_RECS" ]; then verdict="new (info<$AGED_RECS)"; young=$((young+1))
+      elif [ "$indeg" -gt 0 ];           then verdict="reused"; mature=$((mature+1))
+      else verdict="UNREUSED -> review / merge?"; mature=$((mature+1)); mature_unreused=$((mature_unreused+1))
+      fi
+      printf '   %-46s %5s %6s %5s  %s\n' "$slug" "$age" "$info" "$indeg" "$verdict"
+    done
+    echo
+    rate=0; [ "$total" -gt 0 ] && rate=$(( reused*100/total ))
+    printf '   %s nodes · linked (in-degree>0): %s (%s%%) · mature (info>=%s recs): %s · mature & UNREUSED: %s\n' \
+      "$total" "$reused" "$rate" "$AGED_RECS" "$mature" "$mature_unreused"
+    if [ "$young" -eq "$total" ]; then
+      echo "   note  no node has seen >=$AGED_RECS records of later traffic yet — reuse verdict premature."
+    elif [ "$mature_unreused" -gt 0 ]; then
+      echo "   note  mature & UNREUSED = likely false-positives of the bar OR of in-degree itself (a node heavily used"
+      echo "         in prose but linked by no other node) — reconsider the bar, add a link, or merge/retire (seven-dpt#4)."
+    fi
+    ;;
+  show|*)
+    [ -f "$LOG" ] || { echo "no log at $LOG"; exit 0; }
+    since=""; [ -f "$MARK" ] && since="$(cat "$MARK")"
+    total="$(grep -c '^---$' "$LOG" 2>/dev/null || true)"
+    if [ -n "$since" ]; then
+      echo "# records since $since (of ~$total total)"; echo
+      awk -v since="$since" '
+        BEGIN { RS="\n---\n" }
+        length($0) > 0 { t=$0; sub(/ .*/,"",t); if (t > since) print $0 "\n---" }
+      ' "$LOG"
+    else
+      echo "# last 25 records (no .last-distilled marker yet; ~$total total)"
+      echo "# tip: after distilling, run  distill.sh --mark <ISO-ts of last handled record>"; echo
+      awk '
+        BEGIN { RS="\n---\n" }
+        length($0) > 0 { rec[++c]=$0 }
+        END { start = (c > 25) ? c - 24 : 1; for (i = start; i <= c; i++) print rec[i] "\n---" }
+      ' "$LOG"
+    fi
+    ;;
+esac

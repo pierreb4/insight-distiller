@@ -1,0 +1,8 @@
+[Unit]
+Description=Insight auto-distiller (gated, staging-only)
+# Runs the cheap volume gate; only on RUN does it spawn the (memory-capped) cheap agent.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/insights/distill-run.sh
+Nice=10

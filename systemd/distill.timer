@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the insight auto-distiller hourly (the gate decides whether to actually distill)
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

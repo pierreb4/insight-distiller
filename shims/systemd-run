@@ -1,0 +1,24 @@
+#!/bin/bash
+# systemd-run shim for non-systemd machines (macOS, minimal Linux) — the distill
+# scripts spawn headless agents via:
+#   systemd-run --user --scope --collect --quiet --slice=claude.slice \
+#     --working-directory=<dir> -p MemoryMax=<n> -- <cmd> <args...>
+# This parses that flag shape, honors --working-directory, drops the cgroup
+# resource controls (no cgroups outside systemd), and execs <cmd> in the
+# foreground — matching --scope --collect semantics (foreground, cleanup on exit).
+#
+# Install per BOOTSTRAP.md: copy to ~/.local/bin/systemd-run (OUTSIDE this
+# agent-writable repo tree) and make sure that dir is on the cron PATH.
+wd=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; break ;;
+    --working-directory=*) wd="${1#--working-directory=}"; shift ;;
+    --working-directory) wd="$2"; shift 2 ;;
+    -p|--property) shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ $# -gt 0 ] || { echo "systemd-run shim: no command after --" >&2; exit 2; }
+if [ -n "$wd" ]; then cd "$wd" || exit 1; fi
+exec "$@"

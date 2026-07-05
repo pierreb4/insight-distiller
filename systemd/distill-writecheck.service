@@ -1,0 +1,10 @@
+[Unit]
+Description=Insight distiller real-write canary (confirms a sandboxed agent can land a file in staging/)
+# Spawns one cheap memory-capped agent; writes OK/FAIL + timestamp to .last-write-check,
+# which `distill.sh --status` (and the SessionStart digest indirectly) surfaces. This is the
+# artifact-level check whose absence let a permission-blocked write path go silent for weeks.
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/insights/distill.sh --write-check
+Nice=10

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Insight auto-distiller (gated, staging-only) — hourly at :17, mirrors systemd/distill.timer.
+     launchd can't expand $HOME in ProgramArguments, so bash -c does; the inline PATH covers
+     claude/jq/the systemd-run shim (~/.local/bin), homebrew (ARM + Intel), and pyenv if present. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>local.distill</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>PATH="$HOME/.local/bin:$HOME/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" exec "$HOME/.claude/insights/distill-run.sh"</string>
+	</array>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Minute</key>
+		<integer>17</integer>
+	</dict>
+	<key>Nice</key>
+	<integer>10</integer>
+	<key>StandardOutPath</key>
+	<string>/dev/null</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/null</string>
+</dict>
+</plist>

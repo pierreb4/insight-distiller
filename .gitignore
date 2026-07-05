@@ -1,0 +1,24 @@
+# ── Machine-local distiller state — MUST NOT sync ─────────────────────────────
+# Each machine distills its OWN firehose and tracks its own progress. The shareable
+# product is the curated graph (*.md) + INDEX + README + the pipeline (*.sh) + design/.
+# Syncing anything below would create phantom "backlog" or clobber another machine's
+# triage cursor. (Cross-MACHINE dedup is a later tier — semantic, not this cache.)
+
+# triage / promotion / canary cursors: .last-crosspass .last-distilled .last-run
+# .last-staged .last-write-check
+.last-*
+
+# distiller run + cross-pass logs: .crosspass.log .distill-run.log
+*.log
+
+# per-machine caches / in-flight (not canonical)
+signatures/
+staging/
+
+# firehose lives at ~/claude-insights.log (outside this dir); never commit it if copied in
+claude-insights.log
+
+# editor / OS cruft
+*.tmp
+*.swp
+.DS_Store
