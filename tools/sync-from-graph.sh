@@ -20,9 +20,20 @@ for d in "${DIRS[@]}";  do rm -rf "${DST:?}/$d"; cp -R "$SRC/$d" "$DST/$d"; done
 # Nodes, INDEX, BOOTSTRAP, README are curated separately in THIS repo — never synced.
 echo "engine files synced from $SRC"
 echo "personal-token check on synced files:"
-if grep -rn 'pierre\|/home/[a-z]' "${FILES[@]/#/$DST/}" "${DIRS[@]/#/$DST/}" 2>/dev/null | grep -v '<user>'; then
+# Case-insensitive, and every token comes from the machine, never from this file, so the check
+# itself names nothing private: /home/<name>, the user and host names, and each pattern in
+# $SRC/.publish-denylist (one ERE per line, kept in the private graph, never synced). A
+# case-sensitive name grep let a capitalised name through in the 2026-09-30 sync.
+pats=('/home/[a-z]' "$(id -un)" "$(hostname -s)")
+if [ -f "$SRC/.publish-denylist" ]; then
+  while IFS= read -r p; do case "$p" in ''|'#'*) ;; *) pats+=("$p") ;; esac; done < "$SRC/.publish-denylist"
+else
+  echo "  (no $SRC/.publish-denylist: checking user and host names only)"
+fi
+rx=$(IFS='|'; printf '%s' "${pats[*]}")
+if grep -rniE "$rx" "${FILES[@]/#/$DST/}" "${DIRS[@]/#/$DST/}" 2>/dev/null | grep -v '<user>'; then
   echo "^^ REVIEW the hits above before committing" >&2; exit 1
 else
-  echo "  clean"
+  echo "  clean (${#pats[@]} patterns)"
 fi
 echo "now: git -C $DST diff  — review, then commit."
