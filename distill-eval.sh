@@ -12,7 +12,7 @@
 #   distill-eval.sh            classify recurrence events + print the router report
 #   distill-eval.sh --dry-run  show candidate events + the assembled prompt; spawn nothing
 set -uo pipefail
-DIR="${DISTILL_DIR:-$HOME/.claude/insights}"; LOG="${DISTILL_LOG:-$HOME/claude-insights.log}"
+DIR="${DISTILL_DIR:-$HOME/.claude/insights}"; LOG="${DISTILL_LOG:-$HOME/.claude/insights/claude-insights.log}"
 CROSSLOG="$DIR/.crosspass.log"; MODEL="${DISTILL_MODEL:-sonnet}"
 FH_WINDOW="${EVAL_FH_WINDOW:-120}"; BODYCAP="${EVAL_BODYCAP:-600}"
 VERIFY_WINDOW="${VERIFY_WINDOW:-7200}"; VERIFY_DT="${VERIFY_DT:-1800}"   # H2 user-turn window / H1 cluster window (sec)
@@ -26,6 +26,34 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; shift; done
 [ -d "$DIR" ] || { echo "no insights dir at $DIR"; exit 1; }
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+
+# RESOLVED-MODEL STAMP (2026-09-29) — see distill-run.sh. The classifier runs with --output-format json;
+# classout.$i.txt gets the envelope's text answer (same bytes as text mode), and models.jsonl gets one
+# {"run", "model_alias", "model_resolved"} row per run, which the reports print and EVAL_KEEP keeps.
+_unwrap() {  # $1=envelope (claude's stdout) $2=file to APPEND the text answer to; prints model_resolved
+  # kept IN SYNC with distill-run.sh (which documents it)
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+try: env = json.loads(raw)
+except ValueError: env = None
+ids = []
+if isinstance(env, dict) and env.get("type") == "result":
+    mu = env.get("modelUsage"); ids = sorted(mu) if isinstance(mu, dict) else []
+    t = env.get("result")
+    if isinstance(t, str): t += "" if t.endswith("\n") else "\n"
+    else:
+        # error_during_execution: text mode printed "Execution error" unterminated and never the
+        # envelope's errors (2.1.285 runHeadless). Both are added (2026-09-30): the next log line
+        # starts on a line of its own, and a cause read (the write canary's) sees the real error.
+        errs = env.get("errors") if isinstance(env.get("errors"), list) else []
+        t = ("Execution error" + (": " + " | ".join(map(str, errs)) if errs else "") + "\n"
+             if env.get("subtype") == "error_during_execution" else "")
+    raw = t.encode("utf-8", "replace")
+open(sys.argv[2], "ab").write(raw)
+print(json.dumps(ids, separators=(",", ":")))
+PY
+}
 
 # ---- phase 1: nodes, in-degree, candidate recurrence events; assemble classifier prompt ----
 python3 - "$DIR" "$LOG" "$CROSSLOG" "$FH_WINDOW" "$BODYCAP" "$WORK" "$([ "$passk" -gt 0 ] && echo 1 || echo 0)" <<'PY'
@@ -133,11 +161,15 @@ if [ "$passk" -gt 0 ]; then
   for i in $(seq 1 "$passk"); do
     echo "  run $i/${passk} ..." >&2
     systemd-run --user --scope --collect --quiet --slice=claude.slice -p MemoryMax=4G -- \
-      claude -p "$(cat "$WORK/prompt.txt")" --model "$MODEL" --allowed-tools Read > "$WORK/classout.$i.txt" 2>/dev/null || true
+      claude -p "$(cat "$WORK/prompt.txt")" --model "$MODEL" --output-format json --allowed-tools Read > "$WORK/envelope.$i.json" 2>/dev/null || true
+    ids="$(_unwrap "$WORK/envelope.$i.json" "$WORK/classout.$i.txt")"
+    printf '{"run":%s,"model_alias":"%s","model_resolved":%s}\n' "$i" "$MODEL" "${ids:-[]}" >>"$WORK/models.jsonl"
   done
   python3 - "$WORK" "$passk" "$MODEL" <<'PY'
-import sys, os, re, collections
+import sys, os, re, collections, json
 WORK, K, MODEL = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+mf=os.path.join(WORK,"models.jsonl")
+mods=[json.loads(l) for l in open(mf,encoding="utf-8") if l.strip()] if os.path.exists(mf) else []
 eids = [l.split("\t")[0] for l in open(os.path.join(WORK,"events.tsv"),encoding="utf-8") if l.strip()]
 runs = []
 for i in range(1,K+1):
@@ -152,6 +184,7 @@ scored=[e for e in eids if any(e in r for r in runs)]
 n=len(scored) or 1
 print("="*74)
 print(f"§6 CLASSIFIER VARIANCE  —  pass^{K}, model={MODEL}, fixed prompt")
+print(f"model_alias={MODEL}  model_resolved by run: " + "  ".join(f"{m['run']}={json.dumps(m['model_resolved'],separators=(',',':'))}" for m in mods))
 print(f"runs producing output: {nonempty}/{K}   events scored: {len(scored)}")
 print("="*74)
 unanimous=0; val_unanimous=0; unstable=[]
@@ -174,6 +207,18 @@ for e in sorted(antis):
 print(f"\n-- UNSTABLE events ({len(unstable)}) — labels disagreed --")
 for e,cnt in unstable[:25]:
     print(f"  [{e}] " + ", ".join(f"{nd}:{vl} x{c}" for (nd,vl),c in cnt.most_common()))
+# Per-event consensus dump — the auditable table (summaries above hide stable rows).
+# Majority valence with the production tie-break (none>origin>applied>anti: a tie can
+# never manufacture the riskier label), then majority node within the winning valence.
+print(f"\n-- PER-EVENT consensus (majority valence; conservative tie-break) --")
+_order={"none":0,"origin":1,"applied":2,"anti":3}
+for e in scored:
+    labels=[r[e] for r in runs if e in r]
+    vc=collections.Counter(v for _,v in labels)
+    best=max(vc.items(), key=lambda kv:(kv[1], -_order.get(kv[0],9)))
+    nds=collections.Counter(nd for nd,v in labels if v==best[0])
+    nd=nds.most_common(1)[0][0] if nds else "NONE"
+    print(f"  {e}\t{nd}:{best[0]}\t({best[1]}/{len(labels)})\t" + "; ".join(f"{n}:{v}" for n,v in labels))
 pct=100*unanimous//n
 v = ("counts fairly stable — labels mostly reproducible; deltas readable with care." if pct>=80
      else "MODERATE noise — read counts as approximate; majority-vote over k before trusting." if pct>=60
@@ -197,7 +242,9 @@ if [ "$ncand" -gt 0 ]; then
   for i in $(seq 1 "$K"); do
     [ "$K" -gt 1 ] && echo "  classifier run $i/$K ..." >&2
     systemd-run --user --scope --collect --quiet --slice=claude.slice -p MemoryMax=4G -- \
-      claude -p "$(cat "$WORK/prompt.txt")" --model "$MODEL" --allowed-tools Read > "$WORK/classout.$i.txt" 2>/dev/null || true
+      claude -p "$(cat "$WORK/prompt.txt")" --model "$MODEL" --output-format json --allowed-tools Read > "$WORK/envelope.$i.json" 2>/dev/null || true
+    ids="$(_unwrap "$WORK/envelope.$i.json" "$WORK/classout.$i.txt")"
+    printf '{"run":%s,"model_alias":"%s","model_resolved":%s}\n' "$i" "$MODEL" "${ids:-[]}" >>"$WORK/models.jsonl"
   done
   python3 - "$WORK" "$K" <<'PY'
 import sys, os, re, collections
@@ -237,7 +284,7 @@ fi
 
 # ---- phase 2.5: VERIFIED tier — corroborate each judged applied/anti with an INDEPENDENT, non-prose
 #      signal so the verdict isn't circular (the classifier reads MY firehose prose). H2 = user
-#      correction/affirmation from the transcript (highest independence — the operator's words). H1 =
+#      correction/affirmation from the transcript (highest independence — the user's own words). H1 =
 #      repeated-attempt cluster in the firehose (medium). hard = high-independence signal present ·
 #      amber = retry-cluster only · soft = judged-only. Pure code; writes verify.tsv (eid strength corrs).
 python3 - "$WORK" "$VERIFY_PROJECTS" "$VERIFY_WINDOW" "$VERIFY_DT" <<'PY'
@@ -308,6 +355,13 @@ for eid,(node,val) in judged.items():
 out.close()
 PY
 
+# Audit escape hatch: EVAL_KEEP=<dir> preserves the per-event artifacts (classifier
+# consensus + verified-tier strengths) for external scoring. Additive only — WORK is
+# still trap-cleaned; without EVAL_KEEP nothing changes.
+if [ -n "${EVAL_KEEP:-}" ]; then
+  mkdir -p "$EVAL_KEEP" && cp -f "$WORK"/classout.txt "$WORK"/consensus.tsv "$WORK"/verify.tsv "$WORK"/events.tsv "$WORK"/models.jsonl "$EVAL_KEEP"/ 2>/dev/null || true
+fi
+
 # ---- phase 3: assemble the (reuse x anti) router report ----
 python3 - "$WORK" "$K" <<'PY'
 import sys, os, re
@@ -363,6 +417,11 @@ print(f"VERIFIED tier (corroborate vs prose): anti hard {_rate(ha,ja)} · applie
 if K>1:
     flagged=sum(1 for _,(_,fl) in consensus.items() if fl)
     print(f"classification: MAJORITY-VOTE consensus of {K} runs (per-event valence agreement in appendix; ! = no majority, spot-check){'' if not flagged else f' — {flagged} flagged'}")
+mf=os.path.join(WORK,"models.jsonl")   # one row per classifier run (none when no event reached the classifier)
+if os.path.exists(mf):
+    import json
+    mods=[json.loads(l) for l in open(mf,encoding="utf-8") if l.strip()]
+    print(f"classifier model_alias={mods[0]['model_alias']}  model_resolved by run: " + "  ".join(f"{m['run']}={json.dumps(m['model_resolved'],separators=(',',':'))}" for m in mods))
 print("="*74)
 routed=[]; dormant=[]; fresh=[]
 for s,n in nodes.items():

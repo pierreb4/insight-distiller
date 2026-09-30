@@ -19,10 +19,58 @@
 #   distill-run.sh --dry-run   print candidates + the assembled prompt + the command; spawn nothing
 set -uo pipefail
 
-DIR="${DISTILL_DIR:-$HOME/.claude/insights}"; LOG="${DISTILL_LOG:-$HOME/claude-insights.log}"  # overrides for boundary-probe.sh; default to the real store
+DIR="${DISTILL_DIR:-$HOME/.claude/insights}"; LOG="${DISTILL_LOG:-$HOME/.claude/insights/claude-insights.log}"  # overrides for boundary-probe.sh; default to the real store
 MARK="$DIR/.last-distilled"; STAGEMARK="$DIR/.last-staged"
 LASTRUN="$DIR/.last-run";    STAGING="$DIR/staging"; RUNLOG="$DIR/.distill-run.log"
 MODEL="${DISTILL_MODEL:-sonnet}"; MAX="${DISTILL_MAX:-50}"   # default sonnet; the 2026-06-22 "haiku didn't reliably stage" was a CONFOUNDED test (staging was permission-blocked regardless of model — fixed 2026-06-23). Re-evaluate haiku vs sonnet on the fixed path before trusting either.
+
+# RESOLVED-MODEL STAMP (2026-09-29). `--model sonnet` is an alias: it moved from claude-sonnet-5 to
+# claude-sonnet-5-5 at 2026-09-28T22:04Z, and a record naming only the alias can be split by model
+# only by timestamp. So claude -p runs with --output-format json, whose envelope's modelUsage is keyed
+# by the concrete id(s) the call ran on, and each record this run writes carries model_alias (the
+# --model value) + model_resolved (those ids, sorted) — one convention across the owner's
+# claude -p wrappers. _unwrap and _stamp_md are kept IN SYNC with
+# distill-crosspass.sh (and _unwrap with distill.sh, distill-eval.sh) by hand.
+_unwrap() {  # $1=envelope (claude's stdout) $2=file to APPEND the text answer to; prints model_resolved
+  # Appends what text mode printed (.result, newline-terminated), so downstream readers see the same
+  # bytes, except error_during_execution, which also gets the envelope's errors and a newline; stdout
+  # as-is when there is no envelope, and then model_resolved is [] — never the alias.
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+try: env = json.loads(raw)
+except ValueError: env = None
+ids = []
+if isinstance(env, dict) and env.get("type") == "result":
+    mu = env.get("modelUsage"); ids = sorted(mu) if isinstance(mu, dict) else []
+    t = env.get("result")
+    if isinstance(t, str): t += "" if t.endswith("\n") else "\n"
+    else:
+        # error_during_execution: text mode printed "Execution error" unterminated and never the
+        # envelope's errors (2.1.285 runHeadless). Both are added (2026-09-30): the next log line
+        # starts on a line of its own, and a cause read (the write canary's) sees the real error.
+        errs = env.get("errors") if isinstance(env.get("errors"), list) else []
+        t = ("Execution error" + (": " + " | ".join(map(str, errs)) if errs else "") + "\n"
+             if env.get("subtype") == "error_during_execution" else "")
+    raw = t.encode("utf-8", "replace")
+open(sys.argv[2], "ab").write(raw)
+print(json.dumps(ids, separators=(",", ":")))
+PY
+}
+_stamp_md() {  # $1=proposal .md in the /tmp out-dir $2=model_alias $3=model_resolved (JSON list)
+  # Two frontmatter fields just above the closing `---` (every reader of a staged draft — distill.sh
+  # --review, eval/fastlane.py, eval/recurrence-probe.py, hooks/pre-commit — keys on other fields, the
+  # body after the frontmatter, or the filename); a final HTML comment line if the agent wrote none.
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+p, alias, ids = sys.argv[1:4]
+t = open(p, encoding="utf-8", errors="surrogateescape").read(); L = t.split("\n")
+end = next((k for k in range(1, len(L)) if L[k].rstrip() == "---"), 0) if L[0].rstrip() == "---" else 0
+if end: L[end:end] = ["model_alias: " + alias, "model_resolved: " + ids]; t = "\n".join(L)
+else: t += ("\n" if t and not t.endswith("\n") else "") + "<!-- model_alias: %s model_resolved: %s -->\n" % (alias, ids)
+open(p, "w", encoding="utf-8", errors="surrogateescape").write(t)
+PY
+}
 
 force=0; dry=0; since_override=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -100,7 +148,7 @@ source: {date: $(date +%F), via: auto-distill-unreviewed}
 created: $(date +%F)
 status: proposed
 ---
-<what is true and why it is reusable, citing evidence from the records>
+<what is true and why it is reusable; cite EACH supporting record as "<ISO-date>: <verbatim snippet>" — a claim with no quoted record does not clear the bar>
 <connections: [[existing-slug]] edges; seven-dpt#<id> for problems>
 
 RULES: write files ONLY under ${STGOUT}/. Touch nothing else — no other file,
@@ -123,7 +171,7 @@ if [ "$dry" -eq 1 ]; then
   echo "candidates   : ${ncand}  (kept/substantive: ${info:-?}; cap ${MAX})"
   echo "model        : ${MODEL}    prompt chars: $(wc -c <"$PF")"
   echo "would spawn  : agent confined to a /tmp out-dir (${STGOUT}), then wrapper copies *.md -> ${STAGING}/"
-  echo "               systemd-run … --working-directory=${STGOUT} --add-dir ${STGOUT} -- claude -p <PROMPT> --model ${MODEL} --allowed-tools Write Read --permission-mode acceptEdits"
+  echo "               systemd-run … --working-directory=${STGOUT} --add-dir ${STGOUT} -- claude -p --model ${MODEL} <prompt-file-on-stdin> --allowed-tools Write Read --permission-mode acceptEdits"
   echo; echo "===================== ASSEMBLED PROMPT ====================="; cat "$PF"
   rm -rf "$STGOUT"; rm -f "$CAND" "$META" "$PF"; exit 0
 fi
@@ -133,14 +181,21 @@ echo "[$(date -Iseconds)] distiller: ${ncand} candidates, model=${MODEL}, since=
 # Agent confined to $STGOUT (/tmp); the wrapper bash copies its proposals into $STAGING.
 # ~/.claude is write-guarded for a headless 'claude -p', so the agent must NOT target $STAGING
 # directly — that silently blocked every write before the 2026-06-23 fix.
+# Prompt rides STDIN, never argv: `claude -p "$(cat $PF)"` overflowed execve's arg limit
+# once the window held multi-KB records ("Argument list too long", rc=126, 8 dead runs
+# 2026-08-06/07 — only the canary noticed). systemd-run --scope execs as our child and
+# inherits fds, so a plain redirect reaches claude's stdin.
+# stdout is the JSON envelope (ENVF); _unwrap appends its text answer to RUNLOG where stdout used to go.
+ENVF="$(mktemp)"
 systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$STGOUT" -p MemoryMax=8G -- \
-  claude -p "$(cat "$PF")" --model "$MODEL" --allowed-tools Write Read --add-dir "$STGOUT" --permission-mode acceptEdits \
-  >>"$RUNLOG" 2>&1
+  claude -p --model "$MODEL" --output-format json --allowed-tools Write Read --add-dir "$STGOUT" --permission-mode acceptEdits \
+  <"$PF" >"$ENVF" 2>>"$RUNLOG"
 rc=$?
+resolved="$(_unwrap "$ENVF" "$RUNLOG")"; resolved="${resolved:-[]}"; stamp="model_alias=$MODEL model_resolved=$resolved"
 date -Iseconds >>"$LASTRUN"
 n_new=0
 if [ "$rc" -eq 0 ]; then
-  for m in "$STGOUT"/*.md; do [ -e "$m" ] || continue; cp -f "$m" "$STAGING/$(basename "$m")" && n_new=$((n_new+1)); done
+  for m in "$STGOUT"/*.md; do [ -e "$m" ] || continue; _stamp_md "$m" "$MODEL" "$resolved"; cp -f "$m" "$STAGING/$(basename "$m")" && n_new=$((n_new+1)); done
 fi
 n="$(ls "$STAGING"/*.md 2>/dev/null | wc -l)"
 # What the agent CLAIMED this run (PROPOSED: N), scoped to this run's output:
@@ -151,12 +206,12 @@ claimed=$(tail -n +"${runstart:-1}" "$RUNLOG" 2>/dev/null | grep -oiE 'PROPOSED:
 # staged 0" run (the claim-not-artifact failure, 2026-06-22) must NOT advance — else the
 # backlog is silently dropped. (each-automated-stage-needs-its-own-canary: judge by the artifact.)
 if [ "$rc" -ne 0 ]; then
-  echo "[$(date -Iseconds)] WARN agent exited rc=$rc — marker NOT advanced (backlog preserved for retry)" >>"$RUNLOG"
+  echo "[$(date -Iseconds)] WARN agent exited rc=$rc — marker NOT advanced (backlog preserved for retry) $stamp" >>"$RUNLOG"
 elif [ "$claimed" -gt 0 ] && [ "$n_new" -le 0 ]; then
-  echo "[$(date -Iseconds)] WARN claimed PROPOSED:$claimed but staged $n_new (claim != artifact) — marker NOT advanced, backlog preserved" >>"$RUNLOG"
+  echo "[$(date -Iseconds)] WARN claimed PROPOSED:$claimed but staged $n_new (claim != artifact) — marker NOT advanced, backlog preserved $stamp" >>"$RUNLOG"
 else
   [ -z "$since_override" ] && [ -n "$latest" ] && printf '%s\n' "$latest" >"$STAGEMARK"   # skip on --since test runs
 fi
-echo "[$(date -Iseconds)] done rc=$rc staged=$n new=$n_new claimed=$claimed" >>"$RUNLOG"   # structured outcome the --status canary reads
-echo "distiller done (rc=$rc, claimed=$claimed, staged_new=$n_new). Review: distill.sh --review  (log: $RUNLOG)"
-rm -rf "$STGOUT"; rm -f "$CAND" "$META" "$PF"
+echo "[$(date -Iseconds)] done rc=$rc staged=$n new=$n_new claimed=$claimed $stamp" >>"$RUNLOG"   # structured outcome the --status canary reads
+echo "distiller done (rc=$rc, claimed=$claimed, staged_new=$n_new, $stamp). Review: distill.sh --review  (log: $RUNLOG)"
+rm -rf "$STGOUT"; rm -f "$CAND" "$META" "$PF" "$ENVF"

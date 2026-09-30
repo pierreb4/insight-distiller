@@ -33,6 +33,7 @@ CORRECTION = re.compile(
     r"|make sure (we|you) (don'?t|do not)|confound|that'?s wrong|not what i)", re.I)
 SLUGPATH = re.compile(r"/\.claude/insights/([a-z0-9-]+)\.md")
 WIKILINK = re.compile(r"\[\[([a-z0-9-]+)\]\]")
+SURFACED = re.compile(r"⚠ ([a-z0-9-]+) —")   # this script's own output line (below) => surfaced
 
 corrections, seen = [], set()
 try:
@@ -41,6 +42,8 @@ try:
             seen.add(m.group(1))          # node path mentioned (Read tool-use or prose) => surfaced
         for m in WIKILINK.finditer(line):
             seen.add(m.group(1))          # [[slug]] mentioned => surfaced
+        for m in SURFACED.finditer(line):
+            seen.add(m.group(1))          # already surfaced at an earlier compaction => not "missed" again
         if '"user"' not in line or '"toolUseResult"' in line:
             continue                       # cheap pre-filter (spacing-robust): skip non-user + tool-result lines
         try:

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Rejection-ledger gate. `staging/` is gitignored, so deleting a staged proposal never
+# appears in any commit: without this, a rejection or sunset can vanish with no record
+# (distillation-policy.md § Rejection ledger). `.last-staged-set` (machine-local, `.last-*`)
+# holds every proposal slug seen staged — written by `distill.sh --review` and by this hook.
+# A slug in that set that is no longer in staging/ must be named in this commit's added
+# lines: a new `<slug>.md`, a rider naming it, a ledger line, or "(staged as <slug>)" in a
+# promotion under a new name. Otherwise the commit fails.
+# Install once per clone:  ln -sf ../../hooks/pre-commit .git/hooks/pre-commit
+# Bypass a deliberate one: git commit --no-verify
+set -u
+DIR="$(git rev-parse --show-toplevel)"
+SET="$DIR/.last-staged-set"
+S="$DIR/staging"
+
+staged_now() { ls "$S"/*.md 2>/dev/null | sed 's|.*/||; s|\.md$||' | grep -v '^REVIEW-' | sort -u; }
+
+[ -f "$SET" ] || { staged_now > "$SET"; exit 0; }
+
+added="$(git diff --cached -U0 --no-color | grep '^+')"
+missing=()
+while IFS= read -r slug; do
+  [ -n "$slug" ] || continue
+  [ -f "$S/$slug.md" ] && continue
+  # discharges: process-memory-must-be-executable
+  printf '%s\n' "$added" | grep -qF -- "$slug" || missing+=("$slug")
+done < "$SET"
+
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "pre-commit: staged proposal(s) left staging/ with no record in this commit:" >&2
+  printf '  %s\n' "${missing[@]}" >&2
+  echo "record each: promote as <slug>.md, name it in a rider or \"(staged as <slug>)\"," >&2
+  echo "or add a '— REJECTED <date>' line to distillation-policy.md § Rejection ledger." >&2
+  exit 1
+fi
+
+staged_now > "$SET"
+exit 0

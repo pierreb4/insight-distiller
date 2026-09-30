@@ -30,7 +30,7 @@
 set -uo pipefail
 
 DIR="${DISTILL_DIR:-$HOME/.claude/insights}"
-LOG="${DISTILL_LOG:-$HOME/claude-insights.log}"
+LOG="${DISTILL_LOG:-$HOME/.claude/insights/claude-insights.log}"
 PROJROOT="${CLAUDE_PROJECTS:-$HOME/.claude/projects}"
 MARK="$DIR/.last-crosspass"; STAGING="$DIR/staging"; SIGDIR="$DIR/signatures"
 RUNLOG="$DIR/.crosspass.log"
@@ -62,6 +62,71 @@ import unicodedata
 def sanitize(s):
     s = unicodedata.normalize("NFC", s)
     return "".join(ch for ch in s if ch in "\n\t" or unicodedata.category(ch) not in ("Cc","Cf","Co","Cn"))'
+
+# RESOLVED-MODEL STAMP (2026-09-29) — see distill-run.sh: claude -p runs with --output-format json and
+# each record names model_alias (the --model value) + model_resolved (the envelope's sorted modelUsage
+# keys; [] without an envelope, never inferred from the alias). A signature carries the stamp as two
+# keys appended before its closing brace; unstamp() removes exactly that text again, so the REDUCE
+# prompt inlines each signature byte-for-byte as its MAP agent wrote it.
+PYUNSTAMP='
+import json
+def unstamp(t):
+    i = t.rfind(",\"model_alias\":"); j = t.rfind("}")
+    if 0 <= i < j:
+        try: d = json.loads("{" + t[i+1:j] + "}")
+        except ValueError: return t
+        if isinstance(d, dict) and set(d) == {"model_alias", "model_resolved"}: return t[:i] + t[j:]
+    return t'
+_unwrap() {  # $1=envelope (claude's stdout) $2=file to APPEND the text answer to; prints model_resolved
+  # kept IN SYNC with distill-run.sh (which documents it)
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+raw = open(sys.argv[1], "rb").read()
+try: env = json.loads(raw)
+except ValueError: env = None
+ids = []
+if isinstance(env, dict) and env.get("type") == "result":
+    mu = env.get("modelUsage"); ids = sorted(mu) if isinstance(mu, dict) else []
+    t = env.get("result")
+    if isinstance(t, str): t += "" if t.endswith("\n") else "\n"
+    else:
+        # error_during_execution: text mode printed "Execution error" unterminated and never the
+        # envelope's errors (2.1.285 runHeadless). Both are added (2026-09-30): the next log line
+        # starts on a line of its own, and a cause read (the write canary's) sees the real error.
+        errs = env.get("errors") if isinstance(env.get("errors"), list) else []
+        t = ("Execution error" + (": " + " | ".join(map(str, errs)) if errs else "") + "\n"
+             if env.get("subtype") == "error_during_execution" else "")
+    raw = t.encode("utf-8", "replace")
+open(sys.argv[2], "ab").write(raw)
+print(json.dumps(ids, separators=(",", ":")))
+PY
+}
+_stamp_md() {  # $1=proposal .md in the /tmp out-dir $2=model_alias $3=model_resolved (JSON list)
+  # kept IN SYNC with distill-run.sh (which documents it)
+  python3 - "$1" "$2" "$3" <<'PY'
+import sys
+p, alias, ids = sys.argv[1:4]
+t = open(p, encoding="utf-8", errors="surrogateescape").read(); L = t.split("\n")
+end = next((k for k in range(1, len(L)) if L[k].rstrip() == "---"), 0) if L[0].rstrip() == "---" else 0
+if end: L[end:end] = ["model_alias: " + alias, "model_resolved: " + ids]; t = "\n".join(L)
+else: t += ("\n" if t and not t.endswith("\n") else "") + "<!-- model_alias: %s model_resolved: %s -->\n" % (alias, ids)
+open(p, "w", encoding="utf-8", errors="surrogateescape").write(t)
+PY
+}
+_stamp_sig() {  # $1=signature .json in the /tmp out-dir $2=model_alias $3=model_resolved; rc 1 = not stamped (left as written)
+  python3 - "$1" "$2" "$3" <<PY
+import json, sys
+$PYUNSTAMP
+p, alias, ids = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+try: t = open(p, encoding='utf-8').read(); d = json.loads(t)
+except ValueError: sys.exit(1)
+if not (isinstance(d, dict) and d and 'model_alias' not in d): sys.exit(1)
+j = t.rfind('}')
+s = t[:j] + ',"model_alias":' + json.dumps(alias) + ',"model_resolved":' + json.dumps(ids, separators=(',', ':')) + t[j:]
+if json.loads(s) != dict(d, model_alias=alias, model_resolved=ids) or unstamp(s) != t: sys.exit(1)
+open(p, 'w', encoding='utf-8').write(s)
+PY
+}
 
 map_project() {
   local sid="$1" f proj short
@@ -295,7 +360,8 @@ EOF
     python3 - "$SIGDIR/$sid.json" <<PY >>"$pf"
 import sys
 $PYSAN
-print(sanitize(open(sys.argv[1],encoding="utf-8").read()))
+$PYUNSTAMP
+print(sanitize(unstamp(open(sys.argv[1],encoding="utf-8").read())))
 PY
   done
   printf '%s' "$pf"
@@ -304,10 +370,15 @@ PY
 # ------------------------------- spawn helper --------------------------------
 # kept IN SYNC with distill-run.sh. $2 is a THROWAWAY /tmp out-dir (NOT ~/.claude, which is
 # write-guarded for headless agents) — the agent's ONLY writable dir; the wrapper copies out.
-spawn() {  # $1=prompt-file $2=out-dir (under /tmp)
+RESOLVED="[]"   # model_resolved of the latest spawn (JSON list), set by spawn()
+spawn() {  # $1=prompt-file $2=out-dir (under /tmp); returns claude's rc
+  local rc
   systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$2" -p MemoryMax=8G -- \
-    claude -p "$(cat "$1")" --model "$MODEL" --allowed-tools Write Read --add-dir "$2" --permission-mode acceptEdits \
-    >>"$RUNLOG" 2>&1
+    claude -p "$(cat "$1")" --model "$MODEL" --output-format json --allowed-tools Write Read --add-dir "$2" --permission-mode acceptEdits \
+    >"$WORK/envelope.json" 2>>"$RUNLOG"
+  rc=$?
+  RESOLVED="$(_unwrap "$WORK/envelope.json" "$RUNLOG")"; RESOLVED="${RESOLVED:-[]}"   # text answer -> RUNLOG, as before
+  return "$rc"
 }
 
 # --------------------------------- dry-run -----------------------------------
@@ -341,26 +412,31 @@ echo "[$(date -Iseconds)] crosspass: ${total:-0} new sessions, ${#TOMAP[@]} to M
 SIGOUT="$WORK/sigout"; STGOUT="$WORK/stgout"; mkdir -p "$SIGOUT" "$STGOUT"
 # MAP — sequential, sandboxed to SIGOUT (/tmp), then copied into SIGDIR. A failed MAP leaves
 # the session un-cached for retry.
-delivered=0
+delivered=0; mapres=""
 for pair in "${TOMAP[@]}"; do
   sid="${pair%%|*}"; ps="${pair#*|}"
   rm -f "$SIGOUT/$sid.json"; pf=$(map_prompt "$sid" "$ps" "$SIGOUT")
-  spawn "$pf" "$SIGOUT"; mrc=$?
+  spawn "$pf" "$SIGOUT"; mrc=$?; mapres+="$RESOLVED"$'\n'
   if [ "$mrc" -eq 0 ] && [ -s "$SIGOUT/$sid.json" ]; then
+    _stamp_sig "$SIGOUT/$sid.json" "$MODEL" "$RESOLVED" \
+      || echo "[$(date -Iseconds)] MAP $sid signature is not a JSON object, stamp not embedded: model_alias=$MODEL model_resolved=$RESOLVED" >>"$RUNLOG"
     cp -f "$SIGOUT/$sid.json" "$SIGDIR/$sid.json" && delivered=$((delivered+1))
   else
-    echo "[$(date -Iseconds)] WARN MAP $sid rc=$mrc / no signature written — left un-cached for retry" >>"$RUNLOG"
+    echo "[$(date -Iseconds)] WARN MAP $sid rc=$mrc / no signature written — left un-cached for retry model_alias=$MODEL model_resolved=$RESOLVED" >>"$RUNLOG"
   fi
   rm -f "$pf"
 done
-[ "${#TOMAP[@]}" -gt 0 ] && echo "[$(date -Iseconds)] MAP delivered ${delivered}/${#TOMAP[@]} signatures" >>"$RUNLOG"
+# the summary line's model_resolved is the sorted union over this pass's MAP runs (each signature carries its own)
+mapres=$(printf '%s' "$mapres" | python3 -c 'import json,sys; print(json.dumps(sorted({m for l in sys.stdin if l.strip() for m in json.loads(l)}), separators=(",", ":")))' 2>/dev/null)
+[ "${#TOMAP[@]}" -gt 0 ] && echo "[$(date -Iseconds)] MAP delivered ${delivered}/${#TOMAP[@]} signatures model_alias=$MODEL model_resolved=${mapres:-[]}" >>"$RUNLOG"
 
-# REDUCE — sandboxed to STGOUT (/tmp); its *.md proposals are copied into STAGING.
+# REDUCE — sandboxed to STGOUT (/tmp); its *.md proposals are stamped, then copied into STAGING.
 rp=$(reduce_prompt "$STGOUT"); nsig=$(grep -c '^--- signature' "$rp")
 spawn "$rp" "$STGOUT"; rc=$?; rm -f "$rp"
+stamp="model_alias=$MODEL model_resolved=$RESOLVED"
 n_new=0
 if [ "$rc" -eq 0 ]; then
-  for m in "$STGOUT"/*.md; do [ -e "$m" ] || continue; cp -f "$m" "$STAGING/$(basename "$m")" && n_new=$((n_new+1)); done
+  for m in "$STGOUT"/*.md; do [ -e "$m" ] || continue; _stamp_md "$m" "$MODEL" "$RESOLVED"; cp -f "$m" "$STAGING/$(basename "$m")" && n_new=$((n_new+1)); done
 fi
 claimed=$(grep -oiE 'CROSS-PASS:[[:space:]]*[0-9]+' "$RUNLOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+'); claimed=${claimed:-0}
 # Advance the marker ONLY when the run genuinely processed the backlog AND its claim matches the
@@ -370,13 +446,13 @@ claimed=$(grep -oiE 'CROSS-PASS:[[:space:]]*[0-9]+' "$RUNLOG" 2>/dev/null | tail
 #                                    yet the marker advanced and silently buried the backlog)
 #   claimed>0 but staged 0 -> hold  (claim != artifact)
 if [ "$rc" -ne 0 ]; then
-  echo "[$(date -Iseconds)] WARN reduce rc=$rc — marker NOT advanced (backlog preserved)" >>"$RUNLOG"
+  echo "[$(date -Iseconds)] WARN reduce rc=$rc — marker NOT advanced (backlog preserved) $stamp" >>"$RUNLOG"
 elif [ "${#INWIN[@]}" -gt 0 ] && [ "${nsig:-0}" -eq 0 ]; then
-  echo "[$(date -Iseconds)] WARN no signatures reached REDUCE (MAP stage failed) — marker NOT advanced, backlog preserved" >>"$RUNLOG"
+  echo "[$(date -Iseconds)] WARN no signatures reached REDUCE (MAP stage failed) — marker NOT advanced, backlog preserved $stamp" >>"$RUNLOG"
 elif [ "$claimed" -gt 0 ] && [ "$n_new" -le 0 ]; then
-  echo "[$(date -Iseconds)] WARN claimed CROSS-PASS:$claimed but staged $n_new (claim != artifact) — marker NOT advanced" >>"$RUNLOG"
+  echo "[$(date -Iseconds)] WARN claimed CROSS-PASS:$claimed but staged $n_new (claim != artifact) — marker NOT advanced $stamp" >>"$RUNLOG"
 else
   [ -z "$since_override" ] && [ -n "$latest" ] && printf '%s\n' "$latest" >"$MARK"
 fi
-echo "[$(date -Iseconds)] crosspass done rc=$rc sigs=$nsig staged_new=$n_new claimed=$claimed delivered=${delivered:-0}" >>"$RUNLOG"
-echo "crosspass done (rc=$rc, signatures=$nsig, staged_new=$n_new, claimed=$claimed). Review: distill.sh --review  (log: $RUNLOG)"
+echo "[$(date -Iseconds)] crosspass done rc=$rc sigs=$nsig staged_new=$n_new claimed=$claimed delivered=${delivered:-0} $stamp" >>"$RUNLOG"   # stamp = the REDUCE run
+echo "crosspass done (rc=$rc, signatures=$nsig, staged_new=$n_new, claimed=$claimed, $stamp). Review: distill.sh --review  (log: $RUNLOG)"
