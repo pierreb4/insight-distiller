@@ -22,7 +22,7 @@ Three mechanisms make the loop:
 
 | mechanism | what | where it's wired |
 |---|---|---|
-| capture (tier 1) | Stop hook appends each turn's assistant text to `~/claude-insights.log` | `settings.json` → `hooks/log-insights.sh` |
+| capture (tier 1) | Stop hook appends each turn's assistant text to `~/.claude/insights/claude-insights.log` (gitignored) | `settings.json` → `hooks/log-insights.sh` |
 | digest + missed-surfacer | SessionStart prints the store one-liner; on compact, surfaces un-consulted lessons after a genuine correction | `settings.json` → `distill.sh --brief`, `distill-missed.sh` |
 | auto-distill + canary + cross-pass | hourly gated triage → `staging/`; daily real-write canary; daily cross-session pass | systemd user timers (or cron) |
 
@@ -39,7 +39,21 @@ chmod +x ~/.claude/hooks/log-insights.sh
 Why copy instead of pointing at the repo file: the pipeline's sandboxed agents get write
 access *inside* `~/.claude/insights/` (staging + markers). A script the Stop hook *executes*
 must live outside that writable tree (`make-invalid-agent-actions-impossible`). After a
-`git pull` that changes `hooks/log-insights.sh`, re-run the `cp`.
+`git pull` that changes `hooks/log-insights.sh`, re-run the `cp`: an old copy keeps writing
+the old path, and loses assistant text and markers (it sliced the transcript at the last
+user entry; the current hook reads on from a per-session cursor).
+
+Capture lives in the store since 2026-09-17 (`~/.claude/insights/claude-insights.log`). On a
+machine with an older log at `~/claude-insights.log`, move it there and link the old name:
+`mv ~/claude-insights.log ~/.claude/insights/ && ln -s ~/.claude/insights/claude-insights.log ~/claude-insights.log`.
+
+Optional, the store's **pre-commit hook**, once per clone:
+`ln -sf ../../hooks/pre-commit ~/.claude/insights/.git/hooks/pre-commit`. It refuses a commit
+that drops a staged proposal without a record of it, a new node without a `## Consequences`
+section (with a "looked at" line) and a `## Hindsight` section (with a "First available:"
+line), and a node whose relation to another goes unstated: it runs `cohere-check.py` from the
+repo root, so the two travel together. Write the two sections by hand; the
+`consequences.py` the hook's message names isn't part of this repo.
 
 Same deployed-copy pattern for the **distillation skill** — the distiller's operating manual
 (when to distill, the ruthless bar, review etiquette), loaded into Claude's context on
@@ -109,6 +123,13 @@ cron fallback (any non-systemd box):
 ```
 - cron's default `PATH` won't have `claude`/`jq`/the shim — give the distill lines their own
   `PATH=` prefix (or a crontab env line) covering `~/.local/bin` and wherever `jq` lives.
+- On macOS the CLI keeps its login in the Keychain, which cron jobs can't read: every agent
+  fails `Not logged in` and `--status` shows `real-write .... FAIL`. Use launchd instead: its
+  agents run in the login session and reach the Keychain. A `launchctl bootstrap gui/…` over
+  ssh works while you're logged in at the console. Only if launchd can't be used, give cron a
+  token from `claude setup-token` in `CLAUDE_CODE_OAUTH_TOKEN`.
+- The launchd agents log to `~/Library/Logs/<label>.log`; read those when a job seems not
+  to run.
 
 ## 4. Validate (fresh-machine expectations)
 ```bash
@@ -116,7 +137,8 @@ bash ~/.claude/insights/distill.sh --status
 ```
 - tier-2 graph: **21 nodes, 0 dangling, 0 unindexed** (the seed pack) ✓
 - tier-1: *no log / 0 records* is CORRECT until the first Stop hook fires — not a failure.
-- Run one Claude session turn, then confirm capture: `tail ~/claude-insights.log`.
+- Run one Claude session turn, then confirm capture: `tail ~/.claude/insights/claude-insights.log`, and a
+  heartbeat line per Stop in `~/.claude/insights/.hook-invocations.log`.
 - `systemctl --user list-timers | grep distill` → 3 timers (launchd: `launchctl list | grep -c local.distill` → 3; cron: `crontab -l | grep -c distill` → 3).
 - Next morning: `--status` shows `real-write .... OK` (the daily canary proved a sandboxed
   agent can land a file in `staging/`).

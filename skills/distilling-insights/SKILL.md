@@ -11,7 +11,7 @@ description: >-
 
 # Distilling insights
 
-Turn the raw `~/claude-insights.log` firehose into durable, linked insight nodes
+Turn the raw `~/.claude/insights/claude-insights.log` firehose into durable, linked insight nodes
 in `~/.claude/insights/`. This is the **model-driven** step between tier-1 capture
 and tier-2 curation: the script only *surfaces* candidates; the judgement is
 yours. The store is global and **not auto-loaded** — it grows without bloating

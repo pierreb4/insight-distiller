@@ -5,17 +5,42 @@
 # The working graph (~/.claude/insights, private) is where the engine is developed and
 # dogfooded; this repo is the publish target. Run, review `git diff`, commit deliberately.
 #   tools/sync-from-graph.sh [path-to-working-graph]   (default: ~/.claude/insights)
+#   tools/sync-from-graph.sh --check [path]   does the same sync into a temp dir and compares it
+#     with this repo: prints the paths that differ and exits 1 if the repo lags, changes nothing.
 set -euo pipefail
+CHECK=0
+if [ "${1:-}" = --check ]; then CHECK=1; shift; fi
 SRC="${1:-$HOME/.claude/insights}"
-DST="$(cd "$(dirname "$0")/.." && pwd)"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
 [ -f "$SRC/distill.sh" ] || { echo "no distill.sh under $SRC — wrong source?" >&2; exit 2; }
+if [ "$CHECK" = 1 ]; then DST="$(mktemp -d)"; trap 'rm -rf "$DST"' EXIT; else DST="$REPO"; fi
 
 FILES=(distill.sh distill-run.sh distill-eval.sh distill-crosspass.sh distill-missed.sh
-       boundary-probe.sh golden-anti-test.sh)
+       boundary-probe.sh golden-anti-test.sh instance-append.py cohere-check.py)
 DIRS=(hooks systemd launchd shims skills)
 
 for f in "${FILES[@]}"; do cp -f "$SRC/$f" "$DST/$f"; done
 for d in "${DIRS[@]}";  do rm -rf "${DST:?}/$d"; cp -R "$SRC/$d" "$DST/$d"; done
+
+# The working graph cites private work items in its comments; the copies drop them. The edits
+# are $SRC/.publish-strip (one `sed -E` expression per line, kept in the private graph, never
+# synced, for the same reason as the denylist below). A file is rewritten only if the edits
+# change it, and in place, so it keeps its mode.
+if [ -f "$SRC/.publish-strip" ]; then
+  find "${FILES[@]/#/$DST/}" "${DIRS[@]/#/$DST/}" -type f | while IFS= read -r f; do
+    s="$(sed -E -f "$SRC/.publish-strip" "$f")"
+    [ "$s" = "$(cat "$f")" ] || printf '%s\n' "$s" > "$f"
+  done
+fi
+
+if [ "$CHECK" = 1 ]; then
+  lag=()
+  for p in "${FILES[@]}" "${DIRS[@]}"; do
+    diff -rq "$DST/$p" "$REPO/$p" >/dev/null 2>&1 || lag+=("$p")
+  done
+  [ ${#lag[@]} -eq 0 ] && exit 0
+  echo "${lag[*]}"; exit 1
+fi
 
 # Nodes, INDEX, BOOTSTRAP, README are curated separately in THIS repo — never synced.
 echo "engine files synced from $SRC"

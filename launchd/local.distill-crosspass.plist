@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Insight cross-session/cross-project distiller (gated, staging-only) — daily 00:27,
-     mirrors systemd/distill-crosspass.timer. The gate decides whether agents actually spawn. -->
+     mirrors systemd/distill-crosspass.timer. The gate decides whether agents actually spawn.
+     stdout and stderr go to ~/Library/Logs/local.distill-crosspass.log. -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -10,7 +11,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>PATH="$HOME/.local/bin:$HOME/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" exec "$HOME/.claude/insights/distill-crosspass.sh"</string>
+		<string>PATH="$HOME/.local/bin:$HOME/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" exec "$HOME/.claude/insights/distill-crosspass.sh" >>"$HOME/Library/Logs/local.distill-crosspass.log" 2>&amp;1</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>
@@ -21,9 +22,5 @@
 	</dict>
 	<key>Nice</key>
 	<integer>10</integer>
-	<key>StandardOutPath</key>
-	<string>/dev/null</string>
-	<key>StandardErrorPath</key>
-	<string>/dev/null</string>
 </dict>
 </plist>

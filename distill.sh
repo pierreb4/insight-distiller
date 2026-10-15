@@ -274,10 +274,30 @@ case "${1:-show}" in
       unindexed=""
       for f in $nodes; do b=$(basename "$f"); grep -qF "$b" "$DIR/INDEX.md" 2>/dev/null || unindexed="$unindexed $b"; done
       [ -n "$unindexed" ] && echo "   unindexed .....$unindexed" || echo "   unindexed ..... none (all nodes in INDEX.md)"
+      # unstated relations between nodes; details: python3 cohere-check.py
+      cohere="$(timeout 120 python3 "$DIR/cohere-check.py" 2>/dev/null | tail -1 | sed 's/^cohere-check: //')"
+      echo "   cohere ........ ${cohere:-not run}  (python3 cohere-check.py for the lines)"
     fi
     ;;
   --brief)
     set +e   # one-line health summary, e.g. for a SessionStart hook
+    # recall, opt-out: every session is told to look in the store before
+    # a new investigation, unless its folder is under a prefix in recall-exclude.tsv (where recall
+    # would spoil a measurement). Printed before the capture check, so a machine whose firehose is
+    # missing still gets it. Both the folder as given and its physical path are matched (/tmp is
+    # /private/tmp on macOS).
+    rcwd="${CLAUDE_PROJECT_DIR:-$PWD}"; rpcwd=$(cd "$rcwd" 2>/dev/null && pwd -P)
+    rexcl=""
+    if [ -f "$DIR/recall-exclude.tsv" ]; then
+      while IFS=$'\t' read -r pre why; do
+        case "$pre" in ''|'#'*) continue ;; esac
+        pre="${pre/#\~/$HOME}"; pre="${pre%/}"
+        for c in "$rcwd" "$rpcwd"; do
+          case "$c/" in "$pre"/*) rexcl="$pre"; break 2 ;; esac
+        done
+      done < "$DIR/recall-exclude.tsv"
+    fi
+    [ -z "$rexcl" ] && echo "recall · before a new investigation or fix, look for a lesson first: grep -ril '<topic>' ~/.claude/insights/*.md (INDEX.md has one line per node; runbooks/ holds cross-project ones); tag one that steers you [applied: node-slug]"
     [ -f "$LOG" ] || { echo "insight store · capture MISSING ($LOG)"; exit 0; }
     now=$(date +%s)
     recs=$(grep -c '^---$' "$LOG" 2>/dev/null)
@@ -307,13 +327,14 @@ case "${1:-show}" in
     # ambient marker reminder — the [applied]/[anti] convention only fires if it rides into
     # every session's context (CLAUDE.md alone measured 1 marker in 12.8k records, 2026-07-21)
     mk=0; [ -f "$DIR/.markers.log" ] && mk=$(grep -c . "$DIR/.markers.log" 2>/dev/null)
-    echo "markers · when an insight node steers an action, tag it INLINE in visible reply text: [applied: node-slug] / [anti: node-slug] for a miss a node should have prevented — Stop-hook tallies to .markers.log (${mk:-0} so far)"
+    echo "markers · when an insight node steers an action, tag it INLINE in visible reply text: [applied: node-slug] / [anti: node-slug <- WHERE] for a miss a node should have prevented, WHERE = where the mistake was made (its words in quotes, a commit, or path:line) — Stop-hook tallies to .markers.log (${mk:-0} so far)"
     # Markers naming no node land in .markers-unknown.log (2026-09-09). Read as a BACKLOG, not as
     # error: a slug applied repeatedly with nothing behind it is a lesson the store never wrote down.
     if [ -s "$DIR/.markers-unknown.log" ]; then
       # The log is append-only, so a slug written up since still sits in it: skip any slug whose
       # node exists NOW (09-21: buildable-is-not-missing, promoted 09-18, was still ranked first).
-      live=$(sed -E 's/.*(applied|anti) //' "$DIR/.markers-unknown.log" 2>/dev/null \
+      # Field 4 only: the hook appends sid= msg= [origin=] after the slug (2026-10-01).
+      live=$(sed -E 's/^[^ ]+ \[[^]]*\] (applied|anti) ([^ ]+).*/\2/' "$DIR/.markers-unknown.log" 2>/dev/null \
              | while read -r s; do [ -n "$s" ] && [ ! -f "$DIR/$s.md" ] && ! grep -q "^$s	" "$DIR/aliases.tsv" 2>/dev/null && echo "$s"; done)
       uk=$(printf '%s\n' "$live" | grep -c .)
       top=$(printf '%s\n' "$live" | sort | uniq -c | sort -rn | head -3 | awk '{printf "%s(%s) ", $2, $1}')
@@ -484,7 +505,8 @@ except Exception: print(0)' "$store" 2>/dev/null)
         cause=$(sed -n 's/^unreused-cause:[[:space:]]*//p' "$f" | head -1)
         ctok=${cause%%[[:space:]]*}; cnote=${cause#"$ctok"}   # note keeps its own em-dash; don't print the token twice
         dref=$(printf '%s\n' "$disch" | grep -E -- "# discharges: $slug\$" | head -1 | sed 's/:# discharges:.*//; s|^'"$HOME"'/||')
-        mk=0; [ -f "$DIR/.markers.log" ] && mk=$(grep -cE -- "(applied|anti) $slug\$" "$DIR/.markers.log" 2>/dev/null || true)
+        # The slug ends at a space, not at end of line: alias= and (2026-10-01) sid= msg= origin= trail it.
+        mk=0; [ -f "$DIR/.markers.log" ] && mk=$(grep -cE -- "(applied|anti) $slug( |\$)" "$DIR/.markers.log" 2>/dev/null || true)
         ev=""; [ -n "$dref" ] && ev="$ev [discharged @$dref]"; [ "${mk:-0}" -gt 0 ] && ev="$ev [markers $mk]"
         case "$ctok" in
           bar)       verdict="UNREUSED / bar$cnote$ev"; u_bar=$((u_bar+1)) ;;

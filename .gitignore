@@ -15,7 +15,7 @@
 signatures/
 staging/
 
-# firehose lives at ~/claude-insights.log (outside this dir); never commit it if copied in
+# the firehose, written here by hooks/log-insights.sh since 2026-09-17; never commit it
 claude-insights.log
 
 # editor / OS cruft

@@ -15,6 +15,53 @@ S="$DIR/staging"
 
 staged_now() { ls "$S"/*.md 2>/dev/null | sed 's|.*/||; s|\.md$||' | grep -v '^REVIEW-' | sort -u; }
 
+# Consequences gate. A NEW node (an added top-level <slug>.md
+# with `type: insight`) must carry a `## Consequences` section that names where it looked
+# (a "looked at" line): six incidents, 10-81 days each, where an insight was banked and the
+# rule, steering code or ledger row it made wrong carried on.
+# Edits to older nodes are not checked. Make the section with:
+#   ~/.claude/scripts/consequences.py --node <slug>.md --terms ... --supports ... --section
+# Hindsight gate, same nodes: a `## Hindsight` section with a
+# "First available:" line, the earliest record that carried the signal (four insights traced
+# back sat 4-50 days in the record, each set aside by a rule: a-demoted-read-is-not-a-negative).
+# "First available: none found, looked at <...>" passes.
+nocons=()
+nohind=()
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  body="$(git show ":$f" 2>/dev/null)" || continue
+  printf '%s\n' "$body" | grep -q '^type: insight' || continue
+  printf '%s\n' "$body" | grep -q '^## Consequences' \
+    && printf '%s\n' "$body" | sed -n '/^## Consequences/,$p' | grep -qi 'looked at' \
+    || nocons+=("$f")
+  printf '%s\n' "$body" | sed -n '/^## Hindsight/,/^## /p' | grep -qi 'first available:' \
+    || nohind+=("$f")
+done < <(git diff --cached --diff-filter=A --name-only -- ':(glob)*.md')
+if [ "${#nohind[@]}" -gt 0 ]; then
+  echo "pre-commit: new node(s) without a '## Hindsight' section with a 'First available:' line:" >&2
+  printf '  %s\n' "${nohind[@]}" >&2
+  echo "trace the signal back to the first record that carried it, then write:" >&2
+  echo "  First available: <record, date> | Missed because: <...> | Earlier next time: <probe |" >&2
+  echo "  canary | trigger | source | none, why> (or 'First available: none found, looked at <...>')" >&2
+  exit 1
+fi
+if [ "${#nocons[@]}" -gt 0 ]; then
+  echo "pre-commit: new node(s) without a '## Consequences' section naming where it looked:" >&2
+  printf '  %s\n' "${nocons[@]}" >&2
+  echo "make one: ~/.claude/scripts/consequences.py --node <file> --terms <its own nouns> \\" >&2
+  echo "  --supports <what the result it flips was evidence for> --section" >&2
+  echo "then answer each hit (changed <commit> | ruled out: <why>); keep the 'looked at' line." >&2
+  exit 1
+fi
+
+# Coherence gate. Reading the store on 2026-10-13 found 51 node
+# pairs whose relation went unstated. For the staged nodes only,
+# refuse: a "not yet a node" phrase naming a node that exists; an ADDED node citing the same
+# rare session id or firehose lines as another node without naming it; a node saying it
+# refines / sharpens / supersedes / is a twin of [[Y]] while Y never names it (edit Y in this
+# commit). Whole-store report: python3 cohere-check.py; its selftest: --selftest.
+python3 "$DIR/cohere-check.py" --staged || exit 1
+
 [ -f "$SET" ] || { staged_now > "$SET"; exit 0; }
 
 added="$(git diff --cached -U0 --no-color | grep '^+')"

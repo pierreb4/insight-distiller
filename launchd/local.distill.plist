@@ -2,7 +2,9 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!-- Insight auto-distiller (gated, staging-only) — hourly at :17, mirrors systemd/distill.timer.
      launchd can't expand $HOME in ProgramArguments, so bash -c does; the inline PATH covers
-     claude/jq/the systemd-run shim (~/.local/bin), homebrew (ARM + Intel), and pyenv if present. -->
+     claude/jq/the systemd-run shim (~/.local/bin), homebrew (ARM + Intel), and pyenv if present.
+     stdout and stderr go to ~/Library/Logs/local.distill.log, also through bash -c ($HOME again):
+     with /dev/null there, the script died under bash 3.2 for a day unseen. -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
@@ -11,7 +13,7 @@
 	<array>
 		<string>/bin/bash</string>
 		<string>-c</string>
-		<string>PATH="$HOME/.local/bin:$HOME/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" exec "$HOME/.claude/insights/distill-run.sh"</string>
+		<string>PATH="$HOME/.local/bin:$HOME/.pyenv/shims:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin" exec "$HOME/.claude/insights/distill-run.sh" >>"$HOME/Library/Logs/local.distill.log" 2>&amp;1</string>
 	</array>
 	<key>StartCalendarInterval</key>
 	<dict>
@@ -20,9 +22,5 @@
 	</dict>
 	<key>Nice</key>
 	<integer>10</integer>
-	<key>StandardOutPath</key>
-	<string>/dev/null</string>
-	<key>StandardErrorPath</key>
-	<string>/dev/null</string>
 </dict>
 </plist>

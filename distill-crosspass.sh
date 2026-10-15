@@ -7,9 +7,12 @@
 #   MAP    — one sandboxed agent per session produces signatures/<sid>.json (CACHED;
 #            re-MAP only if the transcript grew). Blind: it sees one session only.
 #   REDUCE — one sandboxed agent reads the in-window signatures and stages a
-#            *proposed* node ONLY for a rhyme across >=2 projects not already in the graph.
-# It writes ONLY signatures/ (MAP) and staging/ (REDUCE) and its own marker — never
-# canonical nodes / INDEX / other markers. Promotion stays a reviewed step.
+#            *proposed* node ONLY for a rhyme across >=2 projects not already in the graph;
+#            a single-project signature that restates a node becomes an INSTANCE row of it.
+# It writes ONLY signatures/ (MAP), staging/ (REDUCE), instances/<host>.tsv (the instance
+# ledger, rows built by instance-append.py from validated slug + session, committed alone)
+# and its own marker — never canonical nodes / INDEX / other markers. Promotion stays a
+# reviewed step.
 #
 # WRITE PATH (2026-06-23): ~/.claude is WRITE-GUARDED for a headless `claude -p` (acceptEdits
 # does not cover it; with no TTY the permission prompt can't be answered, so the write blocks).
@@ -25,10 +28,13 @@
 #   distill-crosspass.sh --force    skip the gate
 #   distill-crosspass.sh --gate     print the gate decision and exit (measure-only)
 #   distill-crosspass.sh --since TS window start override (for tests; skips marker advance)
+#   distill-crosspass.sh --until TS window end (for replays; skips marker advance, as --since does)
 #   distill-crosspass.sh --dry-run  print plan (sessions, project map, prompts, commands); spawn nothing
-#   distill-crosspass.sh --status   health canary (last pass, sessions, staged)
+#   distill-crosspass.sh --status   health canary (last pass, sessions, staged, instances)
 set -uo pipefail
 
+HERE="$(cd "$(dirname "$0")" && pwd)"; IAPP="$HERE/instance-append.py"   # next to this script, so a scratch copy runs its own
+HOST="$(hostname -s 2>/dev/null || hostname)"
 DIR="${DISTILL_DIR:-$HOME/.claude/insights}"
 LOG="${DISTILL_LOG:-$HOME/.claude/insights/claude-insights.log}"
 PROJROOT="${CLAUDE_PROJECTS:-$HOME/.claude/projects}"
@@ -47,12 +53,13 @@ MINPROJ=2
 _mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null; }
 _epoch() { date -d "$1" +%s 2>/dev/null || python3 -c 'import sys; from datetime import datetime; print(int(datetime.fromisoformat(sys.argv[1]).timestamp()))' "$1" 2>/dev/null; }
 
-force=0; dry=0; gate_only=0; since_override=""
+force=0; dry=0; gate_only=0; since_override=""; until=""
 while [ $# -gt 0 ]; do case "$1" in
   --force) force=1 ;;
   --dry-run) dry=1 ;;
   --gate) gate_only=1 ;;
   --since) since_override="${2:-}"; shift ;;
+  --until) until="${2:-}"; shift ;;
   --status) STATUS=1 ;;
   *) echo "unknown arg: $1" >&2; exit 2 ;;
 esac; shift; done
@@ -176,12 +183,14 @@ if [ "${STATUS:-0}" = 1 ]; then
   fi
   echo "   signatures ..... $(ls "$SIGDIR"/*.json 2>/dev/null | grep -c . ) cached"
   echo "   staged (review). $(ls "$STAGING"/*.md 2>/dev/null | grep -c . ) in staging/"
+  echo "   instances ...... $(cat "$DIR"/instances/*.tsv 2>/dev/null | grep -vc '^#') rows in instances/ ($(grep -vc '^#' "$DIR/instances/$HOST.tsv" 2>/dev/null || echo 0) from $HOST)"
   if [ -f "$RUNLOG" ]; then
     lastdone=$(grep -E '\] crosspass done rc=' "$RUNLOG" 2>/dev/null | tail -1)
     if [ -n "$lastdone" ]; then
       drc=$(printf '%s' "$lastdone" | sed -n 's/.*done rc=\([0-9-]*\).*/\1/p')
       dwhen=$(printf '%s' "$lastdone" | sed -n 's/^\[\([^]]*\)\].*/\1/p')
-      printf '   last pass run .. %s  rc=%s\n' "${dwhen:-?}" "${drc:-?}"
+      dinst=$(printf '%s' "$lastdone" | grep -oE 'instances=[0-9]+ new_place=[0-9]+')
+      printf '   last pass run .. %s  rc=%s%s\n' "${dwhen:-?}" "${drc:-?}" "${dinst:+  $dinst}"
       case "$drc" in 0|''|*[!0-9]*) ;; *) echo "   WARN last cross-pass FAILED (rc=$drc) — see $RUNLOG" ;; esac
     fi
   fi
@@ -207,7 +216,7 @@ run_gate() {
 }
 
 if [ "$gate_only" = 1 ]; then run_gate; exit $?; fi
-if [ "$force" -eq 0 ] && [ -z "$since_override" ]; then
+if [ "$force" -eq 0 ] && [ -z "$since_override" ] && [ -z "$until" ]; then
   line=$(run_gate); rc=$?; echo "$line"; [ "$rc" -eq 0 ] || exit 0
 fi
 
@@ -216,18 +225,20 @@ if [ -n "$since_override" ]; then since="$since_override"
 else since=""; [ -f "$MARK" ] && since=$(cat "$MARK" 2>/dev/null); fi
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
-MAN="$(python3 - "$LOG" "${since:-}" "$MAXSESS" "$PERSESS_CAP" "$WORK" "$PROJROOT" 2>/dev/null <<PY
+MAN="$(python3 - "$LOG" "${since:-}" "$MAXSESS" "$PERSESS_CAP" "$WORK" "$PROJROOT" "$until" 2>/dev/null <<PY
 import sys, re, os, glob
 $PYSAN
-log, since, maxsess, cap, work, projroot = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
+log, since, maxsess, cap, work, projroot, until = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6], sys.argv[7]
 start = re.compile(r'^(\S+)\s+\[([0-9a-f]{6,8})\]\s', re.S)
-sess = {}; latest = ""
+sess = {}; lines = {}; latest = ""; ln = 1   # lines: sid -> firehose line of each record's first line
 for ch in open(log, encoding="utf-8").read().split("\n---\n"):
+    at = ln + len(ch) - len(ch.lstrip("\n")); ln += ch.count("\n") + 2
     c = sanitize(ch.strip("\n")); m = start.match(c)
     if not m: continue
     ts, sid = m.group(1), m.group(2)
     if since and ts <= since: continue
-    sess.setdefault(sid, []).append((ts, c))
+    if until and ts > until: continue
+    sess.setdefault(sid, []).append((ts, c)); lines.setdefault(sid, []).append(at)
     if ts > latest: latest = ts
 order = sorted(sess, key=lambda s: max(t for t,_ in sess[s]), reverse=True)
 def _projdir(sid):
@@ -251,7 +262,8 @@ for sid in real[:maxsess]:
     body = "\n---\n".join(r for _,r in rs); trunc = 1 if len(body) > cap else 0
     if trunc: body = body[-cap:]
     open(os.path.join(work, sid + ".records"), "w", encoding="utf-8").write(body)
-    print("S\t%s\t%s\t%d\t%d" % (sid, last_ts, len(rs), trunc))
+    il = "IL:%d" % lines[sid][0] + ("-%d" % lines[sid][-1] if len(lines[sid]) > 1 else "")
+    print("S\t%s\t%s\t%d\t%d\t%s" % (sid, last_ts, len(rs), trunc, il))
 PY
 )"
 latest=$(printf '%s\n' "$MAN" | awk -F'\t' '$1=="LATEST"{print $2}')
@@ -261,16 +273,17 @@ rawtotal=$(printf '%s\n' "$MAN" | awk -F'\t' '$1=="RAWTOTAL"{print $2}')
 mkdir -p "$SIGDIR" "$STAGING"
 declare -a TOMAP=() INWIN=()
 mapinfo=""
-while IFS=$'\t' read -r tag sid last_ts nrec trunc; do
+IMAN="$WORK/instance-manifest.tsv"; : >"$IMAN"   # sid ts project il — what instance-append.py validates a REDUCE row against
+while IFS=$'\t' read -r tag sid last_ts nrec trunc il; do
   [ "$tag" = "S" ] || continue
-  pm=$(map_project "$sid") || { mapinfo+="  $sid  project=UNMAPPED (skipped — can't satisfy cross-project)\n"; continue; }
+  pm=$(map_project "$sid") || { mapinfo+="  $sid  project=UNMAPPED (skipped — can't satisfy cross-project)  $il\n"; continue; }
   pkey=$(printf '%s' "$pm" | cut -f1); pshort=$(printf '%s' "$pm" | cut -f2); tpath=$(printf '%s' "$pm" | cut -f3)
-  INWIN+=("$sid|$pkey|$pshort")
+  INWIN+=("$sid|$pkey|$pshort"); printf '%s\t%s\t%s\t%s\n' "$sid" "$last_ts" "$pshort" "$il" >>"$IMAN"
   sig="$SIGDIR/$sid.json"; state="MISSING"
   if [ -f "$sig" ]; then smt=$(_mtime "$sig"); tmt=$(_mtime "$tpath")
     if [ "${smt:-0}" -ge "${tmt:-0}" ]; then state="FRESH"; else state="STALE"; fi; fi
   [ "$state" = "FRESH" ] || TOMAP+=("$sid|$pshort")
-  mapinfo+="  $sid  project=$pshort  recs=$nrec$([ "$trunc" = 1 ] && echo ' (TRUNCATED)')  cache=$state\n"
+  mapinfo+="  $sid  project=$pshort  recs=$nrec$([ "$trunc" = 1 ] && echo ' (TRUNCATED)')  cache=$state  $il\n"
 done < <(printf '%s\n' "$MAN")
 
 # ---------------------------- MAP prompt builder -----------------------------
@@ -299,8 +312,13 @@ EOF
 }
 
 # --------------------------- REDUCE prompt builder ---------------------------
-GRAPH="$(for f in "$DIR"/*.md; do b="$(basename "$f")"; case "$b" in INDEX.md|README.md) continue;; esac
-  d="$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)"; printf -- '- %s: %s\n' "${b%.md}" "$d"; done)"
+# A node's line carries "[seen in: a, b]", the projects of its instances (node lines and ledger rows),
+# so a single-project signature restating a node already seen elsewhere reads as the recurrence it is.
+SEEN="$(python3 "$IAPP" projects --store "$DIR" 2>/dev/null)"
+GRAPH="$(for f in "$DIR"/*.md; do b="$(basename "$f")"; case "$b" in (INDEX.md|README.md) continue;; esac
+  d="$(sed -n 's/^description:[[:space:]]*//p' "$f" | head -1)"
+  s="$(printf '%s\n' "$SEEN" | awk -F'\t' -v k="${b%.md}" '$1==k{gsub(",", ", ", $2); print $2}')"
+  printf -- '- %s: %s%s\n' "${b%.md}" "$d" "${s:+ [seen in: $s]}"; done)"
 reduce_prompt() {  # $1=outdir ; emits a prompt file path; inlines all in-window cached signatures
   local od="$1" pf sid pkey pshort n=0; pf="$(mktemp)"
   cat >"$pf" <<EOF
@@ -311,7 +329,9 @@ move that recurs across the signatures.
 
 THE BAR (ruthless — usually ZERO survive; a STAGED node is rare):
 1. CROSS-PROJECT: the move must recur across >= ${MINPROJ} DISTINCT projects. A
-   within-one-project move is NOT a rhyme — drop it (do not merge-suggest it either).
+   within-one-project move is NOT a rhyme: neither stage nor merge-suggest it. If it
+   restates an existing node (point 3), record it as an INSTANCE of that node (below);
+   otherwise drop it.
 2. SPECIFIC UNIFICATION, not a vague skeleton. Two sessions with DIFFERENT surface
    mechanisms DO rhyme when ONE specific, non-obvious, actionable invariant genuinely
    explains both — finding that unification is the whole point of this pass, so do NOT
@@ -327,7 +347,8 @@ THE BAR (ruthless — usually ZERO survive; a STAGED node is rare):
    existing node.
 When in doubt at ANY of 1-3, do NOT stage. Zero staged is the common, correct outcome.
 
-EXISTING NODES (slug: description) — do not duplicate; you may name one to merge into:
+EXISTING NODES (slug: description [seen in: projects of its recorded instances]) — do not
+duplicate; you may name one to merge into:
 ${GRAPH}
 
 FOR EACH KEEPER (0 to 2) use Write to create ${od}/<kebab-slug>.md with EXACTLY:
@@ -346,10 +367,17 @@ status: proposed
 For a RHYME (passing the bar) whose core claim OVERLAPS an existing node, do NOT create a
 file — instead emit one line: "MERGE-SUGGESTION: <one-line claim> ~> [[existing-slug]]".
 Only a genuinely NEW keeper gets a staged file. A single-project move is neither staged nor
-merge-suggested — it is dropped.
+merge-suggested.
+
+INSTANCES: for each single-project signature whose move restates an existing node, use Write
+to put one line in ${od}/instances.tsv: "<existing-slug><TAB><session>", the slug of the
+closest node and the signature's "session" value, one line per signature, nothing else on
+it. A wrapper validates both and records the instance on that node. If its node is [seen in]
+another project, the signature is that move recurring across projects: say so in your reply.
+A single-project move that restates no node is dropped.
 
 RULES: write files ONLY under ${od}/. Touch nothing else. End with one line:
-"CROSS-PASS: <n> staged — <slugs> · <k> merge-suggestions  (from <s> sessions / <p> projects; dropped <m>)".
+"CROSS-PASS: <n> staged — <slugs> · <k> merge-suggestions · <i> instances  (from <s> sessions / <p> projects; dropped <m>)".
 
 SIGNATURES:
 EOF
@@ -384,7 +412,7 @@ spawn() {  # $1=prompt-file $2=out-dir (under /tmp); returns claude's rc
 # --------------------------------- dry-run -----------------------------------
 if [ "$dry" -eq 1 ]; then
   echo "== DRY RUN — nothing spawned =="
-  echo "window since : ${since:-<all>}"
+  echo "window since : ${since:-<all>}${until:+   until: $until}"
   echo "latest ts    : ${latest:-?}    real new sessions: ${total:-0} of ${rawtotal:-?} raw (sandbox-filtered)  (cap ${MAXSESS})"
   echo "sessions     :"; printf "$mapinfo"
   echo "to MAP       : ${#TOMAP[@]} session(s) need a (re)signature; ${#INWIN[@]} mappable in window"
@@ -402,13 +430,15 @@ if [ "$dry" -eq 1 ]; then
   echo; echo "would spawn (reduce) — agent confined to a /tmp out-dir, then copied:"
   echo "  systemd-run … --working-directory=<tmp> --add-dir <tmp> -- claude -p <REDUCE_PROMPT> --allowed-tools Write Read --permission-mode acceptEdits"
   echo "  then (wrapper bash): cp <tmp>/*.md ${STAGING}/"
+  echo "  then: instance-append.py append --rows <tmp>/instances.tsv --manifest <sid ts project il> --commit -> ${DIR}/instances/${HOST}.tsv"
+  echo; echo "===== INSTANCE MANIFEST ====="; cat "$IMAN"
   exit 0
 fi
 
 # ---------------------------------- real run ---------------------------------
 # Agents are confined to a throwaway /tmp out-dir (NOT ~/.claude — write-guarded for headless
 # `claude -p`); the wrapper (plain bash, unguarded) copies their output into signatures//staging/.
-echo "[$(date -Iseconds)] crosspass: ${total:-0} new sessions, ${#TOMAP[@]} to MAP, model=${MODEL}, since=${since:-all}" >>"$RUNLOG"
+echo "[$(date -Iseconds)] crosspass: ${total:-0} new sessions, ${#TOMAP[@]} to MAP, model=${MODEL}, since=${since:-all}${until:+ until=$until}" >>"$RUNLOG"
 SIGOUT="$WORK/sigout"; STGOUT="$WORK/stgout"; mkdir -p "$SIGOUT" "$STGOUT"
 # MAP — sequential, sandboxed to SIGOUT (/tmp), then copied into SIGDIR. A failed MAP leaves
 # the session un-cached for retry.
@@ -435,8 +465,15 @@ rp=$(reduce_prompt "$STGOUT"); nsig=$(grep -c '^--- signature' "$rp")
 spawn "$rp" "$STGOUT"; rc=$?; rm -f "$rp"
 stamp="model_alias=$MODEL model_resolved=$RESOLVED"
 n_new=0
+inst="instances=0 new_place=0 rejected=0"
 if [ "$rc" -eq 0 ]; then
   for m in "$STGOUT"/*.md; do [ -e "$m" ] || continue; _stamp_md "$m" "$MODEL" "$RESOLVED"; cp -f "$m" "$STAGING/$(basename "$m")" && n_new=$((n_new+1)); done
+  # instance rows: the agent named slug + session only; instance-append.py validates both against the
+  # store and $IMAN, fills date/project/IL from $IMAN, appends to instances/$HOST.tsv and commits that file alone
+  [ -f "$STGOUT/instances.tsv" ] && cp -f "$STGOUT/instances.tsv" "$WORK/instances.agent.tsv"
+  inst=$(python3 "$IAPP" append --store "$DIR" --host "$HOST" --via "crosspass:$(date +%F)" \
+           --rows "$WORK/instances.agent.tsv" --manifest "$IMAN" --commit 2>>"$RUNLOG" | tail -1)
+  inst="${inst:-instances=? new_place=? rejected=?}"
 fi
 claimed=$(grep -oiE 'CROSS-PASS:[[:space:]]*[0-9]+' "$RUNLOG" 2>/dev/null | tail -1 | grep -oE '[0-9]+'); claimed=${claimed:-0}
 # Advance the marker ONLY when the run genuinely processed the backlog AND its claim matches the
@@ -452,7 +489,7 @@ elif [ "${#INWIN[@]}" -gt 0 ] && [ "${nsig:-0}" -eq 0 ]; then
 elif [ "$claimed" -gt 0 ] && [ "$n_new" -le 0 ]; then
   echo "[$(date -Iseconds)] WARN claimed CROSS-PASS:$claimed but staged $n_new (claim != artifact) — marker NOT advanced $stamp" >>"$RUNLOG"
 else
-  [ -z "$since_override" ] && [ -n "$latest" ] && printf '%s\n' "$latest" >"$MARK"
+  [ -z "$since_override" ] && [ -z "$until" ] && [ -n "$latest" ] && printf '%s\n' "$latest" >"$MARK"
 fi
-echo "[$(date -Iseconds)] crosspass done rc=$rc sigs=$nsig staged_new=$n_new claimed=$claimed delivered=${delivered:-0} $stamp" >>"$RUNLOG"   # stamp = the REDUCE run
-echo "crosspass done (rc=$rc, signatures=$nsig, staged_new=$n_new, claimed=$claimed, $stamp). Review: distill.sh --review  (log: $RUNLOG)"
+echo "[$(date -Iseconds)] crosspass done rc=$rc sigs=$nsig staged_new=$n_new claimed=$claimed delivered=${delivered:-0} $inst $stamp" >>"$RUNLOG"   # stamp = the REDUCE run
+echo "crosspass done (rc=$rc, signatures=$nsig, staged_new=$n_new, claimed=$claimed, $inst, $stamp). Review: distill.sh --review; instances: instance-append.py show <slug>  (log: $RUNLOG)"
