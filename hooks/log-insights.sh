@@ -4,6 +4,12 @@
 # A "turn" = all assistant JSONL entries since the last user message, because
 # each tool-use round creates a new assistant line.
 PAYLOAD=$(cat)
+# Headless runs (`claude -p` evals, judges, the distiller itself; ~15 a day on our main machine) are not
+# conversation: skip them, as scripts/hook_scope.py does.
+[ "$CLAUDE_CODE_ENTRYPOINT" = "sdk-cli" ] && exit 0
+case "$(echo "$PAYLOAD" | jq -r '.cwd // empty')" in
+  /tmp|/tmp/*|/private/tmp|/private/tmp/*|/var/folders/*) exit 0 ;;
+esac
 TRANSCRIPT=$(echo "$PAYLOAD" | jq -r '.transcript_path // empty')
 SESSION=$(echo "$PAYLOAD" | jq -r '.session_id // empty')
 LOG="$HOME/.claude/insights/claude-insights.log"
@@ -35,11 +41,14 @@ TAILBUF=$(mktemp); trap 'rm -f "$TAILBUF"' EXIT
 CURDIR="$HOME/.claude/insights/.stop-cursor"; mkdir -p "$CURDIR" 2>/dev/null
 CURSOR_F="$CURDIR/${SESSION:-none}"
 ASSTBUF=$(mktemp); trap 'rm -f "$TAILBUF" "$ASSTBUF"' EXIT
-for try in 1 2 3; do
+# Polled every 0.2 s (up to 4 s), not slept in 2 s steps: on our main machine the final entry was
+# unflushed at nearly every Stop, so every turn paid the full 2 s (median 2077 ms over 3002
+# Stops) for a flush that lands well inside it.
+for try in $(seq 1 20); do
   tail -n 20000 "$TRANSCRIPT" > "$TAILBUF"
   grep '"type":"assistant"' "$TAILBUF" > "$ASSTBUF"
   tail -1 "$ASSTBUF" | jq -e '[.message.content[]? | select(.type=="text")] | length > 0' >/dev/null 2>&1 && break
-  sleep 2
+  sleep 0.2
 done
 CURSOR=$(cat "$CURSOR_F" 2>/dev/null)
 # First Stop of a session under the cursor: start at the last real prompt (a user entry that
@@ -86,6 +95,12 @@ fi
 # mistake took one subagent ~78k tokens for 3 hits. The fields trail slug (and alias=), as
 # alias= does: readers that take the first four fields are unchanged; distill.sh's two
 # end-anchored reads were loosened in the same change.
+#
+# A marker written as code is a mention, not a mark (2026-10-22). Of 329
+# lines, 3 quoted another session's marker (a distillation report, two sigout extractors) and the
+# unknown log held 8 more, 6 of them the placeholder `slug`; every one sat in backticks, and none
+# of the 258 readable real marks did. So fenced blocks, then ``double`` and `single` spans, are cut
+# before the scan. Test: hooks/test-log-insights-markers.py.
 MARKERS_DIR="$HOME/.claude/insights"
 if [ -d "$MARKERS_DIR" ] && [ -n "$CAPTURED" ]; then
   # The same entries and text blocks as CAPTURED (timestamp > CURSOR), scanned per entry so each
@@ -93,6 +108,7 @@ if [ -d "$MARKERS_DIR" ] && [ -n "$CAPTURED" ]; then
   jq -r --arg c "$CURSOR" '
       select((.timestamp // "") > $c) | (.uuid // "-") as $u
       | .message.content[]? | select(.type=="text") | .text
+      | gsub("```[\\s\\S]*?(```|$)"; "") | gsub("``[^\\n]*?``"; "") | gsub("`[^`\\n]*`"; "")
       | scan("\\[(applied|anti): *([a-z0-9][a-z0-9-]*)(?: *<- *([^\\]\\n]*))?")
       | [.[0], .[1], $u, ((.[2] // "") | sub("^\\s+"; "") | sub("\\s+$"; "") | gsub("\\s+"; "_"))]
       | @tsv
@@ -111,5 +127,16 @@ if [ -d "$MARKERS_DIR" ] && [ -n "$CAPTURED" ]; then
         echo "$TS [${SESSION:0:8}] $kind $slug $keys" >> "$MARKERS_DIR/.markers-unknown.log"
       fi
     done
+fi
+# Re-attribution (2026-10-22). The check above is made once, at mark
+# time, so a marker written before its node (or alias) existed stayed unknown for good: 154 of
+# 307 unknown lines named a node by then. When a node, a runbook or aliases.tsv is newer than
+# the last pass (a pulled one too), reattribute-markers.py moves what resolves into .markers.log.
+REATTR="$HOME/.claude/scripts/reattribute-markers.py"
+if [ -s "$MARKERS_DIR/.markers-unknown.log" ] && [ -f "$REATTR" ]; then
+  if [ ! -f "$MARKERS_DIR/.last-reattribute" ] || [ -n "$(find "$MARKERS_DIR" "$MARKERS_DIR/runbooks" -maxdepth 1 \
+       \( -name '*.md' -o -name aliases.tsv \) -newer "$MARKERS_DIR/.last-reattribute" 2>/dev/null | head -1)" ]; then
+    python3 "$REATTR" >/dev/null 2>&1 || true
+  fi
 fi
 exit 0

@@ -326,7 +326,8 @@ case "${1:-show}" in
     echo "insight store · ${stale}${recs:-0} captured, last write ${age} ago · ${undist:-0} untriaged · ${nodes:-0} nodes${cpx}"
     # ambient marker reminder — the [applied]/[anti] convention only fires if it rides into
     # every session's context (CLAUDE.md alone measured 1 marker in 12.8k records, 2026-07-21)
-    mk=0; [ -f "$DIR/.markers.log" ] && mk=$(grep -c . "$DIR/.markers.log" 2>/dev/null)
+    # .markers-mac.log: the Mac's, copied here by ~/projects/sync
+    mk=$(cat "$DIR/.markers.log" "$DIR/.markers-mac.log" 2>/dev/null | grep -c . || true)
     echo "markers · when an insight node steers an action, tag it INLINE in visible reply text: [applied: node-slug] / [anti: node-slug <- WHERE] for a miss a node should have prevented, WHERE = where the mistake was made (its words in quotes, a commit, or path:line) — Stop-hook tallies to .markers.log (${mk:-0} so far)"
     # Markers naming no node land in .markers-unknown.log (2026-09-09). Read as a BACKLOG, not as
     # error: a slug applied repeatedly with nothing behind it is a lesson the store never wrote down.
@@ -506,7 +507,7 @@ except Exception: print(0)' "$store" 2>/dev/null)
         ctok=${cause%%[[:space:]]*}; cnote=${cause#"$ctok"}   # note keeps its own em-dash; don't print the token twice
         dref=$(printf '%s\n' "$disch" | grep -E -- "# discharges: $slug\$" | head -1 | sed 's/:# discharges:.*//; s|^'"$HOME"'/||')
         # The slug ends at a space, not at end of line: alias= and (2026-10-01) sid= msg= origin= trail it.
-        mk=0; [ -f "$DIR/.markers.log" ] && mk=$(grep -cE -- "(applied|anti) $slug( |\$)" "$DIR/.markers.log" 2>/dev/null || true)
+        mk=$(cat "$DIR/.markers.log" "$DIR/.markers-mac.log" 2>/dev/null | grep -cE -- "(applied|anti) $slug( |\$)" || true)
         ev=""; [ -n "$dref" ] && ev="$ev [discharged @$dref]"; [ "${mk:-0}" -gt 0 ] && ev="$ev [markers $mk]"
         case "$ctok" in
           bar)       verdict="UNREUSED / bar$cnote$ev"; u_bar=$((u_bar+1)) ;;
