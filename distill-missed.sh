@@ -83,10 +83,16 @@ if not mistake_terms:
 
 # ---- score never-surfaced nodes by significant-term overlap with the correction ----
 idx = {}
-ipath = os.path.join(DIR, "INDEX.md")
-if os.path.exists(ipath):
+# INDEX.md and its older lines' parts in index/
+ipaths = [os.path.join(DIR, "INDEX.md")]
+if os.path.isdir(os.path.join(DIR, "index")):
+    ipaths += sorted(os.path.join(DIR, "index", f) for f in os.listdir(os.path.join(DIR, "index"))
+                     if f.endswith(".md"))
+for ipath in ipaths:
+    if not os.path.exists(ipath):
+        continue
     for line in open(ipath, encoding="utf-8"):
-        m = re.match(r"\s*-\s*\[([a-z0-9-]+)\]\(\1\.md\)\s*[—-]\s*(.+)", line)
+        m = re.match(r"\s*-\s*\[([a-z0-9-]+)\]\((?:\.\./)?\1\.md\)\s*[—-]\s*(.+)", line)
         if m:
             idx[m.group(1)] = m.group(2).strip()
 scored = []

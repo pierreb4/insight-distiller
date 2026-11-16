@@ -96,7 +96,11 @@ def check_stale(nodes, alias_map, index_text=None, only=None):
     known = set(nodes) | set(alias_map)
     hits = []
     files = dict(nodes)
-    if index_text is not None:
+    # index_text: INDEX.md's text, or {name: text} for INDEX.md and its parts in index/;
+    # a hit names the file, e.g. index/01.md:12
+    if isinstance(index_text, dict):
+        files.update(index_text)
+    elif index_text is not None:
         files["INDEX"] = index_text
     for slug, text in files.items():
         if only is not None and slug not in only:
@@ -327,7 +331,11 @@ def main(argv):
             return 1
         return 0
     nodes, alias_map = load(), aliases()
-    index_text = open(os.path.join(STORE, "INDEX.md"), encoding="utf-8").read()
+    index_text = {"INDEX": open(os.path.join(STORE, "INDEX.md"), encoding="utf-8").read()}
+    parts = os.path.join(STORE, "index")
+    for f in sorted(os.listdir(parts)) if os.path.isdir(parts) else []:
+        if f.endswith(".md"):
+            index_text["index/" + f[:-3]] = open(os.path.join(parts, f), encoding="utf-8").read()
     hits = (check_stale(nodes, alias_map, index_text) + check_shared(nodes, alias_map)
             + check_onesided(nodes, alias_map) + check_cited(nodes, alias_map))
     show(hits)

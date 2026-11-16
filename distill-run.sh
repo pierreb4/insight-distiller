@@ -181,7 +181,8 @@ EOF
 cat "$CAND" >>"$PF"
 
 # 5. dry-run shows everything; real run spawns the capped, memory-bounded cheap agent
-latest="$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+\+[0-9:]+' "$LOG" 2>/dev/null | sort | tail -1)"
+# -a: a NUL run (power loss mid-append, 2026-11-05) makes GNU grep call the log binary and stop printing matches, test-log-nul.sh
+latest="$(grep -aoE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+\+[0-9:]+' "$LOG" 2>/dev/null | sort | tail -1)"
 if [ "$dry" -eq 1 ]; then
   echo "== DRY RUN — nothing spawned =="
   echo "window since : ${since:-<all>}"

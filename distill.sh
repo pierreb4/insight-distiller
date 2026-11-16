@@ -148,7 +148,7 @@ case "${1:-show}" in
       recs=$(grep -c '^---$' "$LOG" 2>/dev/null)
       mt=$(_mtime "$LOG")
       sz=$(_fsize "$LOG" | numfmt --to=iec 2>/dev/null)
-      lastrec=$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+\+[0-9:]+' "$LOG" 2>/dev/null | sort | tail -1)
+      lastrec=$(grep -aoE '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]+\+[0-9:]+' "$LOG" 2>/dev/null | sort | tail -1)
       echo "tier-1  capture    $LOG"
       printf '   records ....... %s\n' "${recs:-0}"
       if [ -n "$mt" ]; then
@@ -266,14 +266,16 @@ case "${1:-show}" in
     nodes=$(ls "$DIR"/*.md 2>/dev/null | grep -vE '/(INDEX|README|BOOTSTRAP)\.md$')
     printf '   nodes ......... %s\n' "$(printf '%s\n' "$nodes" | grep -c .)"
     if [ -n "$nodes" ]; then
-      edges=$(grep -hoE '\[\[[a-z0-9-]+\]\]' $nodes 2>/dev/null | sort -u | tr -d '][')
+      # ledger/: distillation-policy's older ledger rounds, moved out word for word
+      edges=$(grep -hoE '\[\[[a-z0-9-]+\]\]' $nodes "$DIR"/ledger/*.md 2>/dev/null | sort -u | tr -d '][')
       printf '   edges ......... %s unique [[wikilinks]]\n' "$(printf '%s\n' "$edges" | grep -c .)"
       dangling=""
       for slug in $edges; do [ -f "$DIR/$slug.md" ] || dangling="$dangling $slug"; done
       [ -n "$dangling" ] && echo "   dangling ......$dangling  (forward-refs; see README)" || echo "   dangling ...... none"
       unindexed=""
-      for f in $nodes; do b=$(basename "$f"); grep -qF "$b" "$DIR/INDEX.md" 2>/dev/null || unindexed="$unindexed $b"; done
-      [ -n "$unindexed" ] && echo "   unindexed .....$unindexed" || echo "   unindexed ..... none (all nodes in INDEX.md)"
+      # INDEX.md and its older lines' parts in index/
+      for f in $nodes; do b=$(basename "$f"); grep -qF "$b" "$DIR/INDEX.md" "$DIR"/index/*.md 2>/dev/null || unindexed="$unindexed $b"; done
+      [ -n "$unindexed" ] && echo "   unindexed .....$unindexed" || echo "   unindexed ..... none (all nodes in INDEX.md or index/)"
       # unstated relations between nodes; details: python3 cohere-check.py
       cohere="$(timeout 120 python3 "$DIR/cohere-check.py" 2>/dev/null | tail -1 | sed 's/^cohere-check: //')"
       echo "   cohere ........ ${cohere:-not run}  (python3 cohere-check.py for the lines)"
@@ -297,7 +299,7 @@ case "${1:-show}" in
         done
       done < "$DIR/recall-exclude.tsv"
     fi
-    [ -z "$rexcl" ] && echo "recall · before a new investigation or fix, look for a lesson first: grep -ril '<topic>' ~/.claude/insights/*.md (INDEX.md has one line per node; runbooks/ holds cross-project ones); tag one that steers you [applied: node-slug]"
+    [ -z "$rexcl" ] && echo "recall · before a new investigation or fix, look for a lesson first: grep -ril '<topic>' ~/.claude/insights/*.md (INDEX.md and index/*.md have one line per node; runbooks/ holds cross-project ones); tag one that steers you [applied: node-slug]"
     [ -f "$LOG" ] || { echo "insight store · capture MISSING ($LOG)"; exit 0; }
     now=$(date +%s)
     recs=$(grep -c '^---$' "$LOG" 2>/dev/null)
