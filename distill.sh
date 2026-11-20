@@ -90,6 +90,7 @@ case "${1:-show}" in
     # The LAST line (2026-09-29) is `model_alias=<--model> model_resolved=<JSON list>` — line 2 on OK.
     set +e
     OUT="$(mktemp -d)"; ERR="$(mktemp)"; ENVF="$(mktemp)"; mkdir -p "$DIR/staging"
+    # ~/.claude/CLAUDE.md (and the hooks, skills) reach this call: every default, no --safe-mode. Kept: the canary must write under the same context as distill-run.sh's worker
     systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$OUT" -p MemoryMax=2G -- \
       claude -p "Use the Write tool to create ./_writecheck.md with EXACTLY the text: ok. Nothing else." \
       --model "${DISTILL_MODEL:-sonnet}" --output-format json --allowed-tools Write --add-dir "$OUT" --permission-mode acceptEdits > "$ENVF" 2>"$ERR"

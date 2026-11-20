@@ -400,6 +400,7 @@ PY
 # write-guarded for headless agents) — the agent's ONLY writable dir; the wrapper copies out.
 RESOLVED="[]"   # model_resolved of the latest spawn (JSON list), set by spawn()
 spawn() {  # $1=prompt-file $2=out-dir (under /tmp); returns claude's rc
+  # ~/.claude/CLAUDE.md (and the hooks, skills) reach this call: every default, no --safe-mode. Kept, as distill-run.sh's call: the same worker, the same context
   local rc
   systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$2" -p MemoryMax=8G -- \
     claude -p "$(cat "$1")" --model "$MODEL" --output-format json --allowed-tools Write Read --add-dir "$2" --permission-mode acceptEdits \

@@ -206,6 +206,7 @@ echo "[$(date -Iseconds)] distiller: ${ncand} candidates, model=${MODEL}, since=
 # 2026-08-06/07 — only the canary noticed). systemd-run --scope execs as our child and
 # inherits fds, so a plain redirect reaches claude's stdin.
 # stdout is the JSON envelope (ENVF); _unwrap appends its text answer to RUNLOG where stdout used to go.
+# ~/.claude/CLAUDE.md (and the hooks, skills) reach this call: every default, no --safe-mode. Kept: the distiller writes the nodes the estate reads, under its conventions, and its banked runs and prompts were all made in this context
 ENVF="$(mktemp)"
 systemd-run --user --scope --collect --quiet --slice=claude.slice --working-directory="$STGOUT" -p MemoryMax=8G -- \
   claude -p --model "$MODEL" --output-format json --allowed-tools Write Read --add-dir "$STGOUT" --permission-mode acceptEdits \

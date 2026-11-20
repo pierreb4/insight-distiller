@@ -35,6 +35,7 @@ STALE = re.compile(r"not yet (?:a )?node|no node yet|not yet written|still[- ]de
                    r"staged sibling|deliberate dangling link", re.I)
 RESOLVED = re.compile(r"promoted|written since|re-pointed|aliased|now a node|exists", re.I)
 DANGLING_HEAD = re.compile(r"dangling|awaiting a node", re.I)
+NEW_CLAIM = re.compile(r"\s*$|#|\s*(?:[-*+]|\d+[.)])\s")  # blank, heading, list item
 TYPED = re.compile(r"\b(refines|sharpens|supersedes|corrects|restates|generali[sz]es|twin)\b"
                    r"(?! by)[^.\n,;)\[]{0,100}?\[\[([a-z0-9-]+)\]\]", re.I)
 RETRACT = re.compile(r"retract|supersed|regime|no longer|is not proof|not proof|withdrawn|"
@@ -115,7 +116,10 @@ def check_stale(nodes, alias_map, index_text=None, only=None):
             if not m or RESOLVED.search(line):
                 continue
             phrase = STALE.search(line)
-            near = line + " " + (lines[i + 1] if phrase and i + 1 < len(lines) else "")
+            # the next line is read with it only as the same claim wrapped: not a blank, a
+            # heading, or a new list item, which is a new claim
+            nxt = lines[i + 1] if phrase and i + 1 < len(lines) else ""
+            near = line + " " + ("" if NEW_CLAIM.match(nxt) else nxt)
             named = [k for k in known if k != slug and re.search(
                 r"(?<![a-z0-9-])" + re.escape(k) + r"(?![a-z0-9-])", near)]
             for k in sorted(named):
@@ -282,6 +286,30 @@ def selftest():
     n, a, _ = at("b9acf1e")
     cases.append(("stale- remediate 'downstream-only fixing -> no node yet'",
                   not any(h[1].startswith("remediate-fallacies-up-a-ladder") for h in check_stale(n, a))))
+    # the next line read as the same claim: 172's ladder row for
+    # solving directly, put under "downstream-only fixing -> no node yet" at 18a0d50, was
+    # refused as naming build-the-solver-not-the-answer; a new list item is a new claim.
+    # Kept: a phrase wrapped onto a plain continuation line, and a " - " inside that line.
+    n18, a18, _ = at("18a0d50")
+    lad = n18["remediate-fallacies-up-a-ladder"].splitlines()
+    k = next(i for i, l in enumerate(lad) if l.startswith("- solving directly"))
+    row, rest = lad[k:k + 3], lad[:k] + lad[k + 3:]
+    d = next(i for i, l in enumerate(rest) if l.startswith("- downstream-only fixing"))
+    ladder = lambda body: {**n18, "remediate-fallacies-up-a-ladder": "\n".join(body)}
+    under = lambda nxt: any(h[1].startswith("remediate-fallacies-up-a-ladder") for h in
+                            check_stale(ladder(rest[:d + 1] + nxt + rest[d + 1:]), a18))
+    cases.append(("stale- ladder 'no node yet' over a new '- ' item naming a node (172)",
+                  not under(row)))
+    for name, nxt in (("'* '", "* x [[build-the-solver-not-the-answer]]"),
+                      ("'2. '", "2. x [[build-the-solver-not-the-answer]]"),
+                      ("indented '  - '", "  - x [[build-the-solver-not-the-answer]]"),
+                      ("heading", "## build-the-solver-not-the-answer"),
+                      ("blank", "")):
+        cases.append((f"stale- ladder 'no node yet' over a {name} line", not under([nxt])))
+    for name, nxt in (("wrapped", "  see [[build-the-solver-not-the-answer]]"),
+                      ("wrapped, ' - ' inside", "  x - [[build-the-solver-not-the-answer]]"),
+                      ("wrapped, '-' no space", "  -see [[build-the-solver-not-the-answer]]")):
+        cases.append((f"stale+ ladder 'no node yet' {name} onto the next line", under([nxt])))
     cleared = ("closed-reader-silently-drops-open-writer-vocabulary.md + "
                "single-carrier-enumeration-undercounts-silently.md")
     cases.append(("shared- cleared single-carrier/closed-reader",

@@ -158,6 +158,7 @@ fi
 if [ "$passk" -gt 0 ]; then
   [ "$ncand" -eq 0 ] && { echo "no candidate events"; exit 0; }
   echo "== §6 classifier variance: pass^${passk} on the fixed current prompt (${ncand} events, terse) ==" >&2
+  # ~/.claude/CLAUDE.md (and the hooks, skills) reach this call: every default, no --safe-mode. Kept, here and in the classifier runs below: the eval measures the classifier in the context distill-run.sh runs it in
   for i in $(seq 1 "$passk"); do
     echo "  run $i/${passk} ..." >&2
     systemd-run --user --scope --collect --quiet --slice=claude.slice -p MemoryMax=4G -- \
